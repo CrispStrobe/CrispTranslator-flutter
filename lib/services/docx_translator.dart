@@ -88,7 +88,8 @@ class FormatRun {
   String? fontName;
   double? fontSize;
   RGBColor? fontColor;
-  Map<String, String> extraProperties; // For preserving unknown XML properties
+  // Preservation of unknown XML nodes (e.g., highlighting, superscript, etc.)
+  List<XmlNode> extraProperties; 
 
   FormatRun({
     required this.text,
@@ -98,8 +99,8 @@ class FormatRun {
     this.fontName,
     this.fontSize,
     this.fontColor,
-    Map<String, String>? extraProperties,
-  }) : extraProperties = extraProperties ?? {};
+    List<XmlNode>? extraProperties,
+  }) : extraProperties = extraProperties ?? [];
 
   @override
   String toString() => 'Run("$text", B:$bold, I:$italic, Font:$fontName)';
@@ -435,25 +436,28 @@ class DocxTranslator {
   TranslatableParagraph _extractParagraph(XmlElement pElem) {
     final runs = <FormatRun>[];
 
-    // Find all run elements that are direct or indirect children
-    for (final elem in pElem.descendants.whereType<XmlElement>()) {
-      if (elem.name.local == 'r') {
-        // Skip if this run contains a footnote reference (we'll preserve those)
-        bool hasFootnoteRef = false;
-        for (final child in elem.descendants.whereType<XmlElement>()) {
-          if (child.name.local == 'footnoteReference' ||
-              child.name.local == 'footnoteRef') {
-            hasFootnoteRef = true;
-            break;
-          }
-        }
+    // 1. RESOLVE BASE FONT (Matching Python's Resolved Font Hierarchy)
+    String? resolvedBaseFont;
+    for (final r in pElem.descendants.whereType<XmlElement>().where((e) => e.name.local == 'r')) {
+      final rPr = r.findElements('rPr', namespace: wNamespace).firstOrNull;
+      final rFonts = rPr?.findElements('rFonts', namespace: wNamespace).firstOrNull;
+      resolvedBaseFont = rFonts?.getAttribute('ascii', namespace: wNamespace) ?? 
+                         rFonts?.getAttribute('hAnsi', namespace: wNamespace);
+      if (resolvedBaseFont != null) break;
+    }
+    resolvedBaseFont ??= "Times New Roman"; // Global fallback
 
-        if (!hasFootnoteRef) {
-          final runText = _extractRunText(elem);
-          if (runText.isNotEmpty) {
-            final formatRun = _extractRunFormatting(elem, runText);
-            runs.add(formatRun);
-          }
+    // 2. EXTRACT RUNS
+    for (final rElem in pElem.children.whereType<XmlElement>().where((e) => e.name.local == 'r')) {
+      // Check if this run is a footnote anchor (w:footnoteReference)
+      bool isAnchor = rElem.descendants.any((d) => 
+        d is XmlElement && (d.name.local == 'footnoteReference' || d.name.local == 'footnoteRef'));
+      
+      if (!isAnchor) {
+        final text = _extractRunText(rElem);
+        if (text.isNotEmpty) {
+          final formatRun = _extractRunFormatting(rElem, text, resolvedBaseFont);
+          runs.add(formatRun);
         }
       }
     }
@@ -471,57 +475,35 @@ class DocxTranslator {
     return buffer.toString();
   }
 
-  FormatRun _extractRunFormatting(XmlElement rElem, String text) {
-    final formatRun = FormatRun(text: text);
+  FormatRun _extractRunFormatting(XmlElement rElem, String text, String fallbackFont) {
+    final formatRun = FormatRun(text: text, fontName: fallbackFont);
 
-    // Find rPr (run properties)
-    for (final child in rElem.children.whereType<XmlElement>()) {
-      if (child.name.local == 'rPr') {
-        // Extract properties
-        for (final prop in child.children.whereType<XmlElement>()) {
-          switch (prop.name.local) {
-            case 'b':
-              formatRun.bold = true;
-              break;
-            case 'i':
-              formatRun.italic = true;
-              break;
-            case 'u':
-              formatRun.underline = true;
-              break;
-            case 'rFonts':
-              formatRun.fontName = prop.getAttribute('ascii') ??
-                  prop.getAttribute('w:ascii') ??
-                  prop.getAttribute('hAnsi') ??
-                  prop.getAttribute('w:hAnsi');
-              break;
-            case 'sz':
-              final val =
-                  prop.getAttribute('val') ?? prop.getAttribute('w:val');
-              if (val != null) {
-                final parsed = double.tryParse(val);
-                if (parsed != null) {
-                  formatRun.fontSize = parsed / 2;
-                }
-              }
-              break;
-            case 'color':
-              final val =
-                  prop.getAttribute('val') ?? prop.getAttribute('w:val');
-              if (val != null && val != 'auto') {
-                try {
-                  formatRun.fontColor = RGBColor.fromHex(val);
-                } catch (e) {
-                  // Ignore invalid colors
-                }
-              }
-              break;
-          }
+    final rPr = rElem.findElements('rPr', namespace: wNamespace).firstOrNull;
+    if (rPr != null) {
+      for (final prop in rPr.children.whereType<XmlElement>()) {
+        switch (prop.name.local) {
+          case 'b': formatRun.bold = true; break;
+          case 'i': formatRun.italic = true; break;
+          case 'u': formatRun.underline = true; break;
+          case 'rFonts':
+            formatRun.fontName = prop.getAttribute('ascii', namespace: wNamespace) ??
+                                 prop.getAttribute('hAnsi', namespace: wNamespace);
+            break;
+          case 'sz':
+            final val = prop.getAttribute('val', namespace: wNamespace);
+            if (val != null) formatRun.fontSize = double.tryParse(val)! / 2;
+            break;
+          case 'color':
+            final val = prop.getAttribute('val', namespace: wNamespace);
+            if (val != null && val != 'auto') formatRun.fontColor = RGBColor.fromHex(val);
+            break;
+          default:
+            // CRITICAL: Preserve highlighting, superscript, etc.
+            formatRun.extraProperties.add(prop.copy());
+            break;
         }
-        break;
       }
     }
-
     return formatRun;
   }
 
@@ -571,59 +553,32 @@ class DocxTranslator {
     String sourceLang,
     String targetLang,
   ) async {
-    final transPara = paraInfo.transPara;
-    final originalText = transPara.getText();
-
+    final originalText = paraInfo.transPara.getText();
     if (originalText.trim().isEmpty) return;
 
-    // 1. Perform Translation
-    // The PythonNLLBONNXBackend now fetches translation AND alignments in one request
-    final translatedText = await translationService.translate(
-      originalText,
-      targetLang,
-      sourceLang,
-    );
-
+    // 1. Sentence Splitting (Parity with Python Step 1)
+    final sentenceRegex = RegExp(r'(?<=[.!?])\s+');
+    final sentences = originalText.split(sentenceRegex).where((s) => s.trim().isNotEmpty).toList();
+    
+    List<String> translatedSentences = [];
+    for (var s in sentences) {
+      translatedSentences.add(await translationService.translate(s, targetLang, sourceLang));
+    }
+    final translatedText = translatedSentences.join(' ');
     paraInfo.translatedText = translatedText;
 
-    // 2. Extract Alignments
-    // Strategy: First, check if the backend already provided BERT-based alignments
-    bool usedBackendAlignment = false;
-    
-    // We check if the translation service has a 'lastAlignments' property 
-    // (This works specifically with our PythonNLLBONNXBackend implementation)
+    // 2. Alignment logic (Remains the same as your code, capturing from backend)
     try {
       final dynamic service = translationService;
-      // We use a safe check here. In a strictly typed environment, 
-      // you'd use 'if (translationService is PythonNLLBONNXBackend)'
       final backendAlignments = service.lastAlignments as List<Alignment>?;
-      
       if (backendAlignments != null && backendAlignments.isNotEmpty) {
         paraInfo.alignment = backendAlignments;
-        usedBackendAlignment = true;
-        _log('🔍 [DEBUG] Using BERT-based alignments from backend');
+        _log('🔍 [DEBUG] Using BERT-based alignments');
       }
     } catch (e) {
-      // service.lastAlignments doesn't exist or failed, fall back to heuristic
-    }
-
-    // 3. Fallback to Heuristic Aligner if backend didn't provide any
-    if (!usedBackendAlignment && aligner != null) {
-      final srcWords = transPara.getWords();
-      final tgtWords = _extractWords(translatedText);
-
-      if (srcWords.isNotEmpty && tgtWords.isNotEmpty) {
-        paraInfo.alignment = aligner!.align(srcWords, tgtWords);
-        _log('ℹ️ [DEBUG] Backend alignment missing, used Heuristic Aligner');
+      if (aligner != null) {
+        paraInfo.alignment = aligner!.align(paraInfo.transPara.getWords(), _extractWords(translatedText));
       }
-    }
-
-    if (verbose) {
-      final alignCount = paraInfo.alignment?.length ?? 0;
-      final preview = originalText.length > 40 
-          ? '${originalText.substring(0, 40)}...' 
-          : originalText;
-      _log('✨ ALIGN: $alignCount links for "$preview"');
     }
   }
 
@@ -656,69 +611,65 @@ class DocxTranslator {
   }
 
   void _rebuildParagraph(ParagraphInfo paraInfo) {
-  if (paraInfo.translatedText == null || paraInfo.translatedText!.trim().isEmpty) {
-    return;
-  }
-  
-  final pElem = paraInfo.element;
-  final transPara = paraInfo.transPara;
-  final translatedText = paraInfo.translatedText!;
-  final alignment = paraInfo.alignment;
-  
-  // STEP 1: Identify and copy footnote runs (before any removal)
-  final footnoteRunsCopies = <XmlElement>[];
-  
-  // Create a list of children to iterate safely
-  final childrenToCheck = pElem.children.whereType<XmlElement>().toList();
-  
-  for (final child in childrenToCheck) {
-    if (child.name.local == 'r') {
-      // Check if this run has a footnote reference
-      bool hasFootnote = child.descendants.whereType<XmlElement>().any(
-        (desc) => desc.name.local == 'footnoteReference' || desc.name.local == 'footnoteRef'
-      );
-      
-      if (hasFootnote) {
-        // Create a DEEP copy of the entire run element
-        final copiedRun = _deepCopyElement(child);
-        footnoteRunsCopies.add(copiedRun);
+    if (paraInfo.translatedText == null || paraInfo.translatedText!.trim().isEmpty) return;
+
+    final pElem = paraInfo.element;
+    final transPara = paraInfo.transPara;
+    final translatedText = paraInfo.translatedText!;
+    final alignment = paraInfo.alignment ?? [];
+
+    // 1. Anchor Extraction (Footnotes)
+    final anchors = pElem.children.whereType<XmlElement>().where((el) {
+      return el.name.local == 'r' && el.descendants.any((d) => 
+        d is XmlElement && (d.name.local == 'footnoteReference' || d.name.local == 'footnoteRef'));
+    }).map((el) => el.copy()).toList();
+
+    // 2. Clear runs only
+    final runsToRemove = pElem.children.where((el) => el is XmlElement && el.name.local == 'r').toList();
+    for (var run in runsToRemove) { pElem.children.remove(run); }
+
+    // 3. Footnote text start
+    final isFootnoteTextPara = paraInfo.location == 'footnote';
+    if (isFootnoteTextPara && anchors.isNotEmpty) {
+      for (var anchor in anchors) { pElem.children.add(anchor); }
+      pElem.children.add(_createSimpleRun('\u00A0'));
+    }
+
+    // 4. Neural mapping (Clean -> Raw)
+    final tgtRawUnits = translatedText.split(RegExp(r'\s+'));
+    final formattedIndices = transPara.getFormattedWordIndices();
+    final cleanToRawTgt = <int, int>{};
+    int cleanIdx = 0;
+    for (int i = 0; i < tgtRawUnits.length; i++) {
+      if (tgtRawUnits[i].contains(RegExp(r'\w'))) {
+        cleanToRawTgt[cleanIdx] = i;
+        cleanIdx++;
       }
     }
-  }
-  
-  // STEP 2: Remove ALL existing run elements (including footnotes)
-  // We need to collect them first, then remove, to avoid concurrent modification
-  final runsToRemove = pElem.children
-      .whereType<XmlElement>()
-      .where((child) => child.name.local == 'r')
-      .toList();
-  
-  for (final run in runsToRemove) {
-    pElem.children.remove(run);
-  }
-  
-  // STEP 3: For footnote paragraphs, add marker first
-  final isFootnote = paraInfo.location == 'footnote';
-  if (isFootnote && footnoteRunsCopies.isNotEmpty) {
-    // Add footnote number at the beginning
-    for (final ref in footnoteRunsCopies) {
-      pElem.children.add(ref);
+
+    final fontTemplate = transPara.runs.isNotEmpty ? transPara.runs.first : null;
+
+    // 5. Reconstruct
+    for (int i = 0; i < tgtRawUnits.length; i++) {
+      final text = tgtRawUnits[i] + (i < tgtRawUnits.length - 1 ? ' ' : '');
+      String? styleType;
+      
+      final matchedSrc = alignment.where((l) => cleanToRawTgt[l.targetIndex] == i).map((l) => l.sourceIndex);
+      for (var sIdx in matchedSrc) {
+        if (formattedIndices['italic_bold']!.contains(sIdx)) { styleType = 'italic_bold'; break; }
+        else if (formattedIndices['bold']!.contains(sIdx)) { styleType = 'bold'; }
+        else if (formattedIndices['italic']!.contains(sIdx) && styleType != 'bold') { styleType = 'italic'; }
+      }
+
+      // CALL THE ADVANCED BUILDER
+      pElem.children.add(_createFormattedRun(text, fontTemplate, styleType));
     }
-    // Add a non-breaking space after the number
-    final spaceRun = _createSimpleRun('\u00A0');
-    pElem.children.add(spaceRun);
-  }
-  
-  // STEP 4: Add translated runs with formatting
-  _reconstructRuns(pElem, transPara, translatedText, alignment);
-  
-  // STEP 5: For body text, add footnotes at end
-  if (!isFootnote && footnoteRunsCopies.isNotEmpty) {
-    for (final ref in footnoteRunsCopies) {
-      pElem.children.add(ref);
+
+    // 6. Citation end
+    if (!isFootnoteTextPara && anchors.isNotEmpty) {
+      for (var anchor in anchors) { pElem.children.add(anchor); }
     }
   }
-}
 
 // Helper method to create a deep copy of an XML element
 XmlElement _deepCopyElement(XmlElement element) {
@@ -839,76 +790,46 @@ XmlElement _createSimpleRun(String text) {
   return builder.buildDocument().rootElement.copy() as XmlElement;
 }
 
-  XmlElement _createFormattedRun(
-      String text, FormatRun? template, String? styleType) {
-    // Create run element with proper namespace
-    final run = XmlElement(XmlName('r', wNamespace));
-
-    // Run properties
-    if (template != null || styleType != null) {
-      final rPr = XmlElement(XmlName('rPr', wNamespace));
-
-      // Apply style type (bold/italic from alignment)
-      if (styleType == 'italic_bold') {
-        rPr.children.add(XmlElement(XmlName('b', wNamespace)));
-        rPr.children.add(XmlElement(XmlName('i', wNamespace)));
-      } else if (styleType == 'bold') {
-        rPr.children.add(XmlElement(XmlName('b', wNamespace)));
-      } else if (styleType == 'italic') {
-        rPr.children.add(XmlElement(XmlName('i', wNamespace)));
-      }
-
-      // Apply baseline aesthetics from template
-      if (template != null) {
-        // Font name
-        if (template.fontName != null) {
-          final rFonts = XmlElement(XmlName('rFonts', wNamespace));
-          rFonts.setAttribute('ascii', template.fontName!,
-              namespace: wNamespace);
-          rFonts.setAttribute('hAnsi', template.fontName!,
-              namespace: wNamespace);
-          rPr.children.add(rFonts);
+  XmlElement _createFormattedRun(String text, FormatRun? template, String? style) {
+    final builder = XmlBuilder();
+    builder.element('w:r', nest: () {
+      builder.element('w:rPr', nest: () {
+        // 1. Neural Styles
+        if (style == 'bold' || style == 'italic_bold') builder.element('w:b');
+        if (style == 'italic' || style == 'italic_bold') builder.element('w:i');
+        
+        // 2. Aesthetics & Theme Bypass
+        if (template != null) {
+          if (template.fontName != null) {
+            builder.element('w:rFonts', attributes: {
+              'w:ascii': template.fontName!,
+              'w:hAnsi': template.fontName!,
+              'w:cs': template.fontName!,
+              'w:eastAsia': template.fontName!,
+            });
+          }
+          if (template.fontSize != null) {
+            final val = (template.fontSize! * 2).round().toString();
+            builder.element('w:sz', attributes: {'w:val': val});
+            builder.element('w:szCs', attributes: {'w:val': val});
+          }
+          if (template.fontColor != null) {
+            builder.element('w:color', attributes: {'w:val': template.fontColor!.toHex()});
+          }
+          if (template.underline == true) {
+            builder.element('w:u', attributes: {'w:val': 'single'});
+          }
+          // 3. Extra Properties (Highlighting, superscript, etc.)
+          for (final node in template.extraProperties) {
+            builder.xml(node.toXmlString());
+          }
         }
-
-        // Font size
-        if (template.fontSize != null) {
-          final sz = XmlElement(XmlName('sz', wNamespace));
-          sz.setAttribute('val', (template.fontSize! * 2).round().toString(),
-              namespace: wNamespace);
-          rPr.children.add(sz);
-        }
-
-        // Color
-        if (template.fontColor != null) {
-          final color = XmlElement(XmlName('color', wNamespace));
-          color.setAttribute('val', template.fontColor!.toHex(),
-              namespace: wNamespace);
-          rPr.children.add(color);
-        }
-
-        // Underline
-        if (template.underline == true) {
-          final u = XmlElement(XmlName('u', wNamespace));
-          u.setAttribute('val', 'single', namespace: wNamespace);
-          rPr.children.add(u);
-        }
-      }
-
-      if (rPr.children.isNotEmpty) {
-        run.children.add(rPr);
-      }
-    }
-
-    // Text element
-    final tElem = XmlElement(XmlName('t', wNamespace));
-    if (text.startsWith(' ') || text.endsWith(' ')) {
-      tElem.setAttribute('space', 'preserve',
-          namespace: 'http://www.w3.org/XML/1998/namespace');
-    }
-    tElem.innerText = text;
-    run.children.add(tElem);
-
-    return run;
+      });
+      builder.element('w:t', nest: text, attributes: {
+        if (text.startsWith(' ') || text.endsWith(' ')) 'xml:space': 'preserve',
+      });
+    });
+    return builder.buildDocument().rootElement.copy() as XmlElement;
   }
 
   // ============================================================================
