@@ -7,13 +7,14 @@ Supports both single translation and batch server mode
 import sys
 import json
 import argparse
+import traceback
 from pathlib import Path
 from optimum.onnxruntime import ORTModelForSeq2SeqLM
 from transformers import AutoTokenizer
 import os
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
-# Suppress warnings
+# Suppress warnings to stderr
 import warnings
 warnings.filterwarnings("ignore")
 
@@ -21,64 +22,80 @@ class NLLBONNXTranslator:
     def __init__(self, model_dir: str, tokenizer_dir: str, verbose: bool = False):
         self.verbose = verbose
         
-        if self.verbose:
-            print(f"📦 Loading ONNX model from: {model_dir}", file=sys.stderr)
+        # Resolve to absolute paths for stability
+        model_path = Path(model_dir).resolve()
+        tokenizer_path = Path(tokenizer_dir).resolve()
         
-        self.model = ORTModelForSeq2SeqLM.from_pretrained(
-            model_dir,
-            encoder_file_name="encoder_model.onnx",
-            decoder_file_name="decoder_model.onnx",
-            decoder_with_past_file_name="decoder_with_past_model.onnx",
-            use_cache=True
-        )
-        
-        # Load tokenizer from separate directory
         if self.verbose:
-            print(f"📦 Loading tokenizer from: {tokenizer_dir}", file=sys.stderr)
-        self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_dir)
+            print(f"📦 Loading ONNX model from: {model_path}", file=sys.stderr)
+            sys.stderr.flush()
+        
+        try:
+            
+            self.model = ORTModelForSeq2SeqLM.from_pretrained(
+                model_path.as_posix(),
+                encoder_file_name="encoder_model.onnx",
+                decoder_file_name="decoder_model.onnx",
+                decoder_with_past_file_name="decoder_with_past_model.onnx",
+                use_cache=True,
+                local_files_only=True
+            )
+            
+            if self.verbose:
+                print(f"✅ ONNX model loaded", file=sys.stderr)
+                sys.stderr.flush()
+        except Exception as e:
+            import traceback
+            print(f"❌ Failed to load ONNX model: {e}", file=sys.stderr)
+            print(traceback.format_exc(), file=sys.stderr)
+            sys.stderr.flush()
+            raise
+        
+        try:
+            if self.verbose:
+                print(f"📦 Loading tokenizer from: {tokenizer_path}", file=sys.stderr)
+                sys.stderr.flush()
+            
+            self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_path.as_posix())
+            
+            if self.verbose:
+                print(f"✅ Tokenizer loaded", file=sys.stderr)
+                sys.stderr.flush()
+        except Exception as e:
+            print(f"❌ Failed to load tokenizer: {str(e)}", file=sys.stderr)
+            sys.stderr.flush()
+            raise
         
         # Language code mapping
         self.lang_codes = {
-            'English': 'eng_Latn',
-            'German': 'deu_Latn',
-            'Spanish': 'spa_Latn',
-            'French': 'fra_Latn',
-            'Italian': 'ita_Latn',
-            'Portuguese': 'por_Latn',
-            'Russian': 'rus_Cyrl',
-            'Chinese': 'zho_Hans',
-            'Japanese': 'jpn_Jpan',
-            'Korean': 'kor_Hang',
-            'Arabic': 'arb_Arab',
-            'Dutch': 'nld_Latn',
-            'Polish': 'pol_Latn',
-            'Turkish': 'tur_Latn',
-            'Czech': 'ces_Latn',
-            'Ukrainian': 'ukr_Cyrl',
-            'Vietnamese': 'vie_Latn',
-            'Hindi': 'hin_Deva',
+            'English': 'eng_Latn', 'German': 'deu_Latn', 'Spanish': 'spa_Latn',
+            'French': 'fra_Latn', 'Italian': 'ita_Latn', 'Portuguese': 'por_Latn',
+            'Russian': 'rus_Cyrl', 'Chinese': 'zho_Hans', 'Japanese': 'jpn_Jpan',
+            'Korean': 'kor_Hang', 'Arabic': 'arb_Arab', 'Dutch': 'nld_Latn',
+            'Polish': 'pol_Latn', 'Turkish': 'tur_Latn', 'Czech': 'ces_Latn',
+            'Ukrainian': 'ukr_Cyrl', 'Vietnamese': 'vie_Latn', 'Hindi': 'hin_Deva',
         }
         
         if self.verbose:
-            print("✅ Model loaded successfully", file=sys.stderr)
+            print("✅ Translator initialized successfully", file=sys.stderr)
+            sys.stderr.flush()
     
     def translate(self, text: str, source_lang: str, target_lang: str) -> str:
         """Translate text from source to target language"""
         src_code = self.lang_codes.get(source_lang, 'eng_Latn')
         tgt_code = self.lang_codes.get(target_lang, 'deu_Latn')
         
-        # Tokenize
+        # Ensure we set the source language for the tokenizer if needed
+        # NLLB usually expects the source lang to be set in the tokenizer
         inputs = self.tokenizer(text, return_tensors="pt")
         forced_bos_token_id = self.tokenizer.convert_tokens_to_ids(tgt_code)
         
-        # Generate
         translated_tokens = self.model.generate(
             **inputs,
             forced_bos_token_id=forced_bos_token_id,
             max_length=256
         )
         
-        # Decode
         translation = self.tokenizer.batch_decode(
             translated_tokens, 
             skip_special_tokens=True
@@ -98,23 +115,35 @@ def run_single(args):
             "target": args.target
         }
         print(json.dumps(result))
+        sys.stdout.flush()
         
     except Exception as e:
         error = {
             "error": str(e),
-            "type": type(e).__name__
+            "type": type(e).__name__,
+            "traceback": traceback.format_exc()
         }
         print(json.dumps(error))
+        sys.stdout.flush()
         sys.exit(1)
 
 def run_server(args):
-    """Batch server mode - reads JSON requests from stdin, writes responses to stdout"""
+    """Batch server mode - reads JSON requests from stdin"""
     try:
-        # Initialize once
-        translator = NLLBONNXTranslator(args.model_dir, args.tokenizer_dir, verbose=False)
+        print("🚀 Starting translation server...", file=sys.stderr)
+        sys.stderr.flush()
         
-        # Signal ready
+        # Initialize once
+        translator = NLLBONNXTranslator(args.model_dir, args.tokenizer_dir, verbose=True)
+        
+        print("📡 Sending ready signal...", file=sys.stderr)
+        sys.stderr.flush()
+        
+        # Signal ready - CRITICAL: must flush!
         print(json.dumps({"status": "ready"}), flush=True)
+        
+        print("✅ Server ready, waiting for requests...", file=sys.stderr)
+        sys.stderr.flush()
         
         # Process requests
         for line in sys.stdin:
@@ -125,12 +154,12 @@ def run_server(args):
                 
                 request = json.loads(line)
                 
-                # Handle shutdown
                 if request.get("command") == "shutdown":
+                    print("🛑 Shutdown command received", file=sys.stderr)
+                    sys.stderr.flush()
                     print(json.dumps({"status": "shutdown"}), flush=True)
                     break
                 
-                # Translate
                 text = request.get("text", "")
                 source = request.get("source", "English")
                 target = request.get("target", "German")
@@ -144,6 +173,8 @@ def run_server(args):
                 print(json.dumps(response), flush=True)
                 
             except Exception as e:
+                print(f"❌ Error processing request: {e}", file=sys.stderr)
+                sys.stderr.flush()
                 error = {
                     "error": str(e),
                     "type": type(e).__name__,
@@ -152,12 +183,20 @@ def run_server(args):
                 print(json.dumps(error), flush=True)
         
     except Exception as e:
+        # Full error output for the Dart side to capture
+        err_msg = str(e)
+        tb = traceback.format_exc()
+        print(f"❌ Server initialization failed: {err_msg}", file=sys.stderr)
+        print(tb, file=sys.stderr)
+        sys.stderr.flush()
+        
         error = {
-            "error": str(e),
+            "error": err_msg,
             "type": type(e).__name__,
-            "status": "init_failed"
+            "status": "init_failed",
+            "traceback": tb
         }
-        print(json.dumps(error))
+        print(json.dumps(error), flush=True)
         sys.exit(1)
 
 def main():

@@ -3,11 +3,13 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import '../translation_backend.dart';
+import '../model_paths.dart';
 
 class PythonNLLBONNXBackend extends TranslationBackend {
   final String scriptPath;
   final String modelDir;
-  final String tokenizerDir;  // ADD THIS
+  final String tokenizerDir;
+  final String alignerDir;  // ADD THIS for future word alignment
   String? _pythonCommand;
   Process? _serverProcess;
   StreamSubscription? _stdoutSubscription;
@@ -17,8 +19,9 @@ class PythonNLLBONNXBackend extends TranslationBackend {
   
   PythonNLLBONNXBackend({
     this.scriptPath = 'scripts/translate_nllb_onnx.py',
-    this.modelDir = 'assets/onnx_models',
-    this.tokenizerDir = 'assets/models',
+    this.modelDir = ModelPaths.nllbModels,
+    this.tokenizerDir = ModelPaths.nllbTokenizer,
+    this.alignerDir = ModelPaths.awesomeAlignInt8,  // ADD THIS - default to INT8 (smaller, faster)
     super.verbose = false,
     super.debug = false,
   });
@@ -28,6 +31,8 @@ class PythonNLLBONNXBackend extends TranslationBackend {
   
   @override
   String get description => 'ONNX Runtime INT8 (via Python bridge)';
+  
+  // ... _findWorkingPython stays the same ...
   
   Future<String?> _findWorkingPython() async {
     final candidates = ['python', 'python3', 'python3.11', 'python3.10'];
@@ -89,70 +94,68 @@ except ImportError:
           '''
 No Python installation found with required packages.
 
-You have multiple Python installations. Please:
-1. Find which Python has the packages:
-   python --version && python -c "import optimum; print('OK')"
-   python3 --version && python3 -c "import optimum; print('OK')"
-
-2. Install packages to the correct Python:
-   python -m pip install optimum onnxruntime transformers
-   OR
-   python3 -m pip install optimum onnxruntime transformers
-
-Or skip the check (if you know packages are installed):
-   SKIP_PYTHON_CHECK=1 dart run lib/services/translate_docx.dart ...
+Install with: python -m pip install optimum onnxruntime transformers
 '''
         );
       }
     }
     
-    // Check files
+    // Check script
     final scriptFile = File(scriptPath);
     if (!scriptFile.existsSync()) {
       throw Exception('Script not found: $scriptPath');
     }
     logDebug('   ✓ Script: $scriptPath');
     
-    final modelDirPath = Directory(modelDir);
-    if (!modelDirPath.existsSync()) {
+    // Check directories
+    if (!Directory(modelDir).existsSync()) {
       throw Exception('Model directory not found: $modelDir');
     }
     logDebug('   ✓ Model dir: $modelDir');
-
-    final tokenizerDirPath = Directory(tokenizerDir);
-    if (!tokenizerDirPath.existsSync()) {
+    
+    if (!Directory(tokenizerDir).existsSync()) {
       throw Exception('Tokenizer directory not found: $tokenizerDir');
     }
     logDebug('   ✓ Tokenizer dir: $tokenizerDir');
     
-    final requiredFiles = [
-      '$modelDir/encoder_model.onnx',
-      '$modelDir/decoder_model.onnx',
-      '$modelDir/decoder_with_past_model.onnx',
-      '$modelDir/config.json',
-    ];
-    
-    for (final file in requiredFiles) {
+    // Check NLLB ONNX files
+    for (final file in ModelPaths.nllbOnnxFiles) {
       if (!File(file).existsSync()) {
-        throw Exception('Required model file not found: $file');
+        throw Exception('Required ONNX model file not found: $file');
       }
     }
-    logDebug('   ✓ All model files present');
+    logDebug('   ✓ All ONNX model files present (${ModelPaths.nllbOnnxFiles.length})');
     
-    final requiredTokenizerFiles = [
-      '$tokenizerDir/tokenizer.json',
-      '$tokenizerDir/tokenizer_config.json',
-      '$tokenizerDir/sentencepiece.bpe.model',
-    ];
-    
-    for (final file in requiredTokenizerFiles) {
+    // Check NLLB config/tokenizer files
+    for (final file in ModelPaths.nllbConfigFiles) {
       if (!File(file).existsSync()) {
-        throw Exception('Required tokenizer file not found: $file');
+        throw Exception('Required config/tokenizer file not found: $file');
       }
     }
-    logDebug('   ✓ All tokenizer files present');
+    logDebug('   ✓ All config/tokenizer files present (${ModelPaths.nllbConfigFiles.length})');
     
-    // Start server process
+    // Check aligner directory (optional but configured)
+    if (Directory(alignerDir).existsSync()) {
+      final alignerModel = '$alignerDir/model.onnx';
+      if (File(alignerModel).existsSync()) {
+        logDebug('   ✓ Word aligner available: $alignerDir');
+      } else {
+        logDebug('   ⚠ Aligner directory exists but model.onnx missing: $alignerDir');
+      }
+    } else {
+      logDebug('   ℹ Word aligner not found: $alignerDir (optional)');
+    }
+    
+    // Check optional Awesome Align variants
+    if (ModelPaths.checkAwesomeAlignInt8()) {
+      logDebug('   ✓ Awesome Align INT8 available');
+    }
+    
+    if (ModelPaths.checkAwesomeAlignFp32()) {
+      logDebug('   ✓ Awesome Align FP32 available');
+    }
+    
+    // Start server
     await _startServer();
     
     logInfo('✅ Python NLLB ONNX backend initialized (using: $_pythonCommand)');
@@ -161,42 +164,53 @@ Or skip the check (if you know packages are installed):
   Future<void> _startServer() async {
     logDebug('🔍 [DEBUG] Starting Python translation server...');
     
+    // 1. DECLARE AT THE VERY TOP to ensure scoping within the listener closures
+    final readyCompleter = Completer<void>();
+
+    // 2. Start the process
     _serverProcess = await Process.start(
       _pythonCommand!,
       [
         scriptPath, 
         '--server', 
         '--model-dir', modelDir,
-        '--tokenizer-dir', tokenizerDir,  
+        '--tokenizer-dir', tokenizerDir,
       ],
       mode: ProcessStartMode.normal,
     );
-    
-    // Listen to stdout
+
+    // 3. Setup the Stdout listener (readyCompleter is now in scope)
     _stdoutSubscription = _serverProcess!.stdout
         .transform(utf8.decoder)
         .transform(LineSplitter())
         .listen((line) {
+      logDebug('   [Python STDOUT] $line');
       try {
         final data = jsonDecode(line);
+        
+        // Immediate failure handling
+        if (data['status'] == 'init_failed') {
+          if (!readyCompleter.isCompleted) {
+            readyCompleter.completeError(Exception(data['error']));
+          }
+        }
+        
         _responseController.add(data);
       } catch (e) {
-        logDebug('Failed to parse server response: $line');
+        // Log is likely just a text message from Python
       }
     });
-    
-    // Listen to stderr for warnings (but don't fail)
+
     _serverProcess!.stderr
         .transform(utf8.decoder)
         .transform(LineSplitter())
         .listen((line) {
-      if (debug && line.trim().isNotEmpty) {
+      if (line.trim().isNotEmpty) {
         logDebug('   [Python] $line');
       }
     });
-    
-    // Wait for ready signal
-    final readyCompleter = Completer<void>();
+
+    // 4. Setup the Ready Signal listener
     final subscription = _responseController.stream.listen((data) {
       if (data['status'] == 'ready') {
         _isServerReady = true;
@@ -205,15 +219,19 @@ Or skip the check (if you know packages are installed):
         }
       }
     });
-    
-    await readyCompleter.future.timeout(
-      Duration(seconds: 30),
-      onTimeout: () {
-        throw Exception('Python server failed to start within 30 seconds');
-      },
-    );
-    
-    subscription.cancel();
+
+    try {
+      // 5. Wait for the signal
+      await readyCompleter.future.timeout(
+        Duration(seconds: 90),
+        onTimeout: () {
+          throw Exception('Python server failed to start within 90 seconds');
+        },
+      );
+    } finally {
+      subscription.cancel();
+    }
+
     logDebug('   ✓ Python server ready');
   }
   
@@ -300,14 +318,10 @@ Or skip the check (if you know packages are installed):
   Future<void> shutdown() async {
     if (_serverProcess != null && _isServerReady) {
       try {
-        // Send shutdown command
         _serverProcess!.stdin.writeln(jsonEncode({'command': 'shutdown'}));
         await _serverProcess!.stdin.flush();
-        
-        // Wait for process to exit
         await _serverProcess!.exitCode.timeout(Duration(seconds: 5));
       } catch (e) {
-        // Force kill if graceful shutdown fails
         _serverProcess!.kill();
       }
       
