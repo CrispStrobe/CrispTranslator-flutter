@@ -132,18 +132,34 @@ class UnifiedTranslator:
     def translate_and_align(self, text, source_lang, target_lang):
         """Perform translation and word alignment in a single pass"""
         try:
-            # 1. Translation
-            tgt_code = self.lang_codes.get(target_lang, 'deu_Latn')
-            inputs = self.tokenizer(text, return_tensors="pt")
+            # PASS-THROUGH FILTER
+            if text.startswith("http") or text.startswith("www"):
+                return text, [] # Don't translate URLs, return as is
             
+            # 1. Translation Setup
+            src_code = self.lang_codes.get(source_lang, 'eng_Latn')
+            tgt_code = self.lang_codes.get(target_lang, 'deu_Latn')
+            
+            # CRITICAL: Set the source language on the tokenizer
+            self.tokenizer.src_lang = src_code
+            
+            # Prepare inputs
+            inputs = self.tokenizer(text, return_tensors="pt")
+            forced_bos_token_id = self.tokenizer.convert_tokens_to_ids(tgt_code)
+            
+            # Generate with stricter parameters to prevent EU Commission loops
             tokens = self.model.generate(
                 **inputs,
-                forced_bos_token_id=self.tokenizer.convert_tokens_to_ids(tgt_code),
-                max_length=256
+                forced_bos_token_id=forced_bos_token_id,
+                max_length=256,
+                num_beams=4,               # Higher quality
+                repetition_penalty=1.2,    # Prevent repetitions
+                no_repeat_ngram_size=3     # Break hallucination loops
             )
+            
             translation = self.tokenizer.batch_decode(tokens, skip_special_tokens=True)[0]
 
-            # 2. Alignment
+            # 2. Alignment Logic (Remains as before)
             links = []
             if self.align_sess:
                 # Tokenize by simple whitespace for alignment input

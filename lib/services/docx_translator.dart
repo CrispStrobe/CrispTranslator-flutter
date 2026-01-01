@@ -3,6 +3,7 @@ import 'dart:typed_data';
 import 'package:archive/archive.dart';
 import 'package:xml/xml.dart';
 import 'dart:convert';
+import 'backends/python_nllb_onnx_backend.dart';
 
 // ============================================================================
 // TRANSLATION INTERFACE
@@ -217,9 +218,6 @@ class DocxTranslator {
     this.verbose = false,
   });
 
-  void _log(String message) {
-    if (verbose) print(message);
-  }
 
   // ============================================================================
   // MAIN TRANSLATION WORKFLOW
@@ -435,9 +433,9 @@ class DocxTranslator {
 
   TranslatableParagraph _extractParagraph(XmlElement pElem) {
     final runs = <FormatRun>[];
-
-    // 1. RESOLVE BASE FONT (Matching Python's Resolved Font Hierarchy)
     String? resolvedBaseFont;
+    
+    // Resolve the "Base Font" (Matching Python's font hierarchy logic)
     for (final r in pElem.descendants.whereType<XmlElement>().where((e) => e.name.local == 'r')) {
       final rPr = r.findElements('rPr', namespace: wNamespace).firstOrNull;
       final rFonts = rPr?.findElements('rFonts', namespace: wNamespace).firstOrNull;
@@ -445,23 +443,20 @@ class DocxTranslator {
                          rFonts?.getAttribute('hAnsi', namespace: wNamespace);
       if (resolvedBaseFont != null) break;
     }
-    resolvedBaseFont ??= "Times New Roman"; // Global fallback
+    resolvedBaseFont ??= "Times New Roman";
 
-    // 2. EXTRACT RUNS
     for (final rElem in pElem.children.whereType<XmlElement>().where((e) => e.name.local == 'r')) {
-      // Check if this run is a footnote anchor (w:footnoteReference)
+      // Skip footnote anchors during extraction (we re-attach them later)
       bool isAnchor = rElem.descendants.any((d) => 
         d is XmlElement && (d.name.local == 'footnoteReference' || d.name.local == 'footnoteRef'));
       
       if (!isAnchor) {
         final text = _extractRunText(rElem);
         if (text.isNotEmpty) {
-          final formatRun = _extractRunFormatting(rElem, text, resolvedBaseFont);
-          runs.add(formatRun);
+          runs.add(_extractRunFormatting(rElem, text, resolvedBaseFont));
         }
       }
     }
-
     return TranslatableParagraph(runs: runs);
   }
 
@@ -477,8 +472,8 @@ class DocxTranslator {
 
   FormatRun _extractRunFormatting(XmlElement rElem, String text, String fallbackFont) {
     final formatRun = FormatRun(text: text, fontName: fallbackFont);
-
     final rPr = rElem.findElements('rPr', namespace: wNamespace).firstOrNull;
+    
     if (rPr != null) {
       for (final prop in rPr.children.whereType<XmlElement>()) {
         switch (prop.name.local) {
@@ -486,19 +481,18 @@ class DocxTranslator {
           case 'i': formatRun.italic = true; break;
           case 'u': formatRun.underline = true; break;
           case 'rFonts':
-            formatRun.fontName = prop.getAttribute('ascii', namespace: wNamespace) ??
-                                 prop.getAttribute('hAnsi', namespace: wNamespace);
+            formatRun.fontName = prop.getAttribute('ascii') ?? prop.getAttribute('hAnsi');
             break;
           case 'sz':
-            final val = prop.getAttribute('val', namespace: wNamespace);
+            final val = prop.getAttribute('val');
             if (val != null) formatRun.fontSize = double.tryParse(val)! / 2;
             break;
           case 'color':
-            final val = prop.getAttribute('val', namespace: wNamespace);
+            final val = prop.getAttribute('val');
             if (val != null && val != 'auto') formatRun.fontColor = RGBColor.fromHex(val);
             break;
           default:
-            // CRITICAL: Preserve highlighting, superscript, etc.
+            // Force preservation of unknown XML nodes (highlighting, etc.)
             formatRun.extraProperties.add(prop.copy());
             break;
         }
@@ -548,38 +542,52 @@ class DocxTranslator {
   // PARAGRAPH TRANSLATION
   // ============================================================================
 
-  Future<void> _translateParagraph(
-    ParagraphInfo paraInfo,
-    String sourceLang,
-    String targetLang,
-  ) async {
+  Future<void> _translateParagraph(ParagraphInfo paraInfo, String sourceLang, String targetLang) async {
     final originalText = paraInfo.transPara.getText();
     if (originalText.trim().isEmpty) return;
 
-    // 1. Sentence Splitting (Parity with Python Step 1)
+    // 1. Sentence Splitting (Matches Python Blueprint Step 1)
     final sentenceRegex = RegExp(r'(?<=[.!?])\s+');
     final sentences = originalText.split(sentenceRegex).where((s) => s.trim().isNotEmpty).toList();
     
     List<String> translatedSentences = [];
-    for (var s in sentences) {
-      translatedSentences.add(await translationService.translate(s, targetLang, sourceLang));
-    }
-    final translatedText = translatedSentences.join(' ');
-    paraInfo.translatedText = translatedText;
+    List<Alignment> combinedAlignments = [];
+    int sourceWordOffset = 0;
+    int targetWordOffset = 0;
 
-    // 2. Alignment logic (Remains the same as your code, capturing from backend)
-    try {
-      final dynamic service = translationService;
-      final backendAlignments = service.lastAlignments as List<Alignment>?;
-      if (backendAlignments != null && backendAlignments.isNotEmpty) {
-        paraInfo.alignment = backendAlignments;
-        _log('🔍 [DEBUG] Using BERT-based alignments');
-      }
-    } catch (e) {
-      if (aligner != null) {
-        paraInfo.alignment = aligner!.align(paraInfo.transPara.getWords(), _extractWords(translatedText));
+    for (var s in sentences) {
+      final t = await translationService.translate(s, targetLang, sourceLang);
+      translatedSentences.add(t);
+
+      // 2. Alignment Offset Management
+      if (translationService is PythonNLLBONNXBackend) {
+        final backend = translationService as PythonNLLBONNXBackend;
+        final currentAligns = backend.lastAlignments;
+        
+        if (currentAligns != null) {
+          for (var a in currentAligns) {
+            combinedAlignments.add(Alignment(
+              a.sourceIndex + sourceWordOffset,
+              a.targetIndex + targetWordOffset,
+            ));
+          }
+        }
+        sourceWordOffset += _extractWords(s).length;
+        targetWordOffset += _extractWords(t).length;
       }
     }
+
+    paraInfo.translatedText = translatedSentences.join(' ');
+    paraInfo.alignment = combinedAlignments;
+
+    if (verbose) {
+      _log('✨ TRANS: ${paraInfo.translatedText}');
+    }
+  }
+
+  // STOP SHORTENING LOGS
+  void _log(String message) {
+    if (verbose) print(message); // Remove any string shortening logic here
   }
 
   List<String> _extractWords(String text) {
@@ -618,38 +626,35 @@ class DocxTranslator {
     final translatedText = paraInfo.translatedText!;
     final alignment = paraInfo.alignment ?? [];
 
-    // 1. Anchor Extraction (Footnotes)
+    // 1. Anchor Extraction (Cloning footnote markers)
     final anchors = pElem.children.whereType<XmlElement>().where((el) {
       return el.name.local == 'r' && el.descendants.any((d) => 
         d is XmlElement && (d.name.local == 'footnoteReference' || d.name.local == 'footnoteRef'));
     }).map((el) => el.copy()).toList();
 
-    // 2. Clear runs only
+    // 2. Clear Runs only
     final runsToRemove = pElem.children.where((el) => el is XmlElement && el.name.local == 'r').toList();
     for (var run in runsToRemove) { pElem.children.remove(run); }
 
-    // 3. Footnote text start
-    final isFootnoteTextPara = paraInfo.location == 'footnote';
-    if (isFootnoteTextPara && anchors.isNotEmpty) {
-      for (var anchor in anchors) { pElem.children.add(anchor); }
+    // 3. Handle Footnote Para Start
+    final isFootnotePara = paraInfo.location == 'footnote';
+    if (isFootnotePara && anchors.isNotEmpty) {
+      for (var a in anchors) pElem.children.add(a);
       pElem.children.add(_createSimpleRun('\u00A0'));
     }
 
-    // 4. Neural mapping (Clean -> Raw)
+    // 4. Neural Mapping (Parity with Python Step 5)
     final tgtRawUnits = translatedText.split(RegExp(r'\s+'));
     final formattedIndices = transPara.getFormattedWordIndices();
     final cleanToRawTgt = <int, int>{};
     int cleanIdx = 0;
     for (int i = 0; i < tgtRawUnits.length; i++) {
-      if (tgtRawUnits[i].contains(RegExp(r'\w'))) {
-        cleanToRawTgt[cleanIdx] = i;
-        cleanIdx++;
-      }
+      if (tgtRawUnits[i].contains(RegExp(r'\w'))) cleanToRawTgt[cleanIdx++] = i;
     }
 
     final fontTemplate = transPara.runs.isNotEmpty ? transPara.runs.first : null;
 
-    // 5. Reconstruct
+    // 5. Reconstruct with Master Formatter
     for (int i = 0; i < tgtRawUnits.length; i++) {
       final text = tgtRawUnits[i] + (i < tgtRawUnits.length - 1 ? ' ' : '');
       String? styleType;
@@ -661,13 +666,12 @@ class DocxTranslator {
         else if (formattedIndices['italic']!.contains(sIdx) && styleType != 'bold') { styleType = 'italic'; }
       }
 
-      // CALL THE ADVANCED BUILDER
       pElem.children.add(_createFormattedRun(text, fontTemplate, styleType));
     }
 
-    // 6. Citation end
-    if (!isFootnoteTextPara && anchors.isNotEmpty) {
-      for (var anchor in anchors) { pElem.children.add(anchor); }
+    // 6. Anchor Body Citation at end
+    if (!isFootnotePara && anchors.isNotEmpty) {
+      for (var a in anchors) pElem.children.add(a);
     }
   }
 
@@ -794,12 +798,12 @@ XmlElement _createSimpleRun(String text) {
     final builder = XmlBuilder();
     builder.element('w:r', nest: () {
       builder.element('w:rPr', nest: () {
-        // 1. Neural Styles
+        // Apply Neural Aligned Styles
         if (style == 'bold' || style == 'italic_bold') builder.element('w:b');
         if (style == 'italic' || style == 'italic_bold') builder.element('w:i');
         
-        // 2. Aesthetics & Theme Bypass
         if (template != null) {
+          // Force Theme Bypass (Parity with copy_font_properties)
           if (template.fontName != null) {
             builder.element('w:rFonts', attributes: {
               'w:ascii': template.fontName!,
@@ -819,12 +823,13 @@ XmlElement _createSimpleRun(String text) {
           if (template.underline == true) {
             builder.element('w:u', attributes: {'w:val': 'single'});
           }
-          // 3. Extra Properties (Highlighting, superscript, etc.)
+          // Re-inject preserved XML nodes
           for (final node in template.extraProperties) {
             builder.xml(node.toXmlString());
           }
         }
       });
+
       builder.element('w:t', nest: text, attributes: {
         if (text.startsWith(' ') || text.endsWith(' ')) 'xml:space': 'preserve',
       });
