@@ -4,35 +4,40 @@ import 'dart:convert';
 import 'dart:io';
 import '../translation_backend.dart';
 import '../model_paths.dart';
+import '../docx_translator.dart';
 
 class PythonNLLBONNXBackend extends TranslationBackend {
   final String scriptPath;
   final String modelDir;
   final String tokenizerDir;
-  final String alignerDir;  // ADD THIS for future word alignment
+  final String alignerDir; 
   String? _pythonCommand;
   Process? _serverProcess;
   StreamSubscription? _stdoutSubscription;
   final _responseController = StreamController<Map<String, dynamic>>.broadcast();
   bool _isServerReady = false;
   int _requestId = 0;
+
+  // Store the BERT alignments from the most recent translation request
+  List<Alignment>? _lastAlignments;
   
   PythonNLLBONNXBackend({
     this.scriptPath = 'scripts/translate_nllb_onnx.py',
     this.modelDir = ModelPaths.nllbModels,
     this.tokenizerDir = ModelPaths.nllbTokenizer,
-    this.alignerDir = ModelPaths.awesomeAlignInt8,  // ADD THIS - default to INT8 (smaller, faster)
+    this.alignerDir = ModelPaths.awesomeAlignInt8,  
     super.verbose = false,
     super.debug = false,
   });
+
+  /// Getter to allow DocxTranslator to access BERT alignments after a translate() call
+  List<Alignment>? get lastAlignments => _lastAlignments;
   
   @override
   String get name => 'Python NLLB ONNX';
   
   @override
-  String get description => 'ONNX Runtime INT8 (via Python bridge)';
-  
-  // ... _findWorkingPython stays the same ...
+  String get description => 'ONNX Runtime INT8 (Unified Translate + Align)';
   
   Future<String?> _findWorkingPython() async {
     final candidates = ['python', 'python3', 'python3.11', 'python3.10'];
@@ -162,12 +167,10 @@ Install with: python -m pip install optimum onnxruntime transformers
   }
   
   Future<void> _startServer() async {
-    logDebug('🔍 [DEBUG] Starting Python translation server...');
+    logDebug('🔍 [DEBUG] Starting Unified Python translation/alignment server...');
     
-    // 1. DECLARE AT THE VERY TOP to ensure scoping within the listener closures
     final readyCompleter = Completer<void>();
 
-    // 2. Start the process
     _serverProcess = await Process.start(
       _pythonCommand!,
       [
@@ -175,11 +178,12 @@ Install with: python -m pip install optimum onnxruntime transformers
         '--server', 
         '--model-dir', modelDir,
         '--tokenizer-dir', tokenizerDir,
+        '--aligner-dir', alignerDir, // Pass the aligner path
+        if (debug) '--verbose',
       ],
       mode: ProcessStartMode.normal,
     );
 
-    // 3. Setup the Stdout listener (readyCompleter is now in scope)
     _stdoutSubscription = _serverProcess!.stdout
         .transform(utf8.decoder)
         .transform(LineSplitter())
@@ -188,7 +192,6 @@ Install with: python -m pip install optimum onnxruntime transformers
       try {
         final data = jsonDecode(line);
         
-        // Immediate failure handling
         if (data['status'] == 'init_failed') {
           if (!readyCompleter.isCompleted) {
             readyCompleter.completeError(Exception(data['error']));
@@ -197,7 +200,7 @@ Install with: python -m pip install optimum onnxruntime transformers
         
         _responseController.add(data);
       } catch (e) {
-        // Log is likely just a text message from Python
+        // Line is not JSON, likely just a status message or warning
       }
     });
 
@@ -210,7 +213,6 @@ Install with: python -m pip install optimum onnxruntime transformers
       }
     });
 
-    // 4. Setup the Ready Signal listener
     final subscription = _responseController.stream.listen((data) {
       if (data['status'] == 'ready') {
         _isServerReady = true;
@@ -221,7 +223,6 @@ Install with: python -m pip install optimum onnxruntime transformers
     });
 
     try {
-      // 5. Wait for the signal
       await readyCompleter.future.timeout(
         Duration(seconds: 90),
         onTimeout: () {
@@ -232,7 +233,7 @@ Install with: python -m pip install optimum onnxruntime transformers
       subscription.cancel();
     }
 
-    logDebug('   ✓ Python server ready');
+    logDebug('   ✓ Unified server ready');
   }
   
   @override
@@ -246,12 +247,14 @@ Install with: python -m pip install optimum onnxruntime transformers
     if (!_isServerReady || _serverProcess == null) {
       throw StateError('Python server not ready');
     }
+
+    // Reset alignments for this new segment to prevent stale data usage
+    _lastAlignments = null;
     
     final isFirstTranslation = requestCount == 0;
-    
     if (verbose && isFirstTranslation) {
-      print('\n🔍 [VERBOSE] First translation:');
-      print('   Source text: "$text"');
+      print('\n🔍 [VERBOSE] Testing first segment with BERT alignment:');
+      print('   Source: "$text"');
       print('   $sourceLang → $targetLang');
     }
     
@@ -265,52 +268,64 @@ Install with: python -m pip install optimum onnxruntime transformers
         'request_id': reqId,
       };
       
-      logDebug('🔍 [DEBUG] Sending request #$reqId: "${text.substring(0, text.length > 30 ? 30 : text.length)}..."');
+      logDebug('🔍 [DEBUG] Sending Unified Request #$reqId: "${text.substring(0, text.length > 30 ? 30 : text.length)}..."');
       
-      // Send request
       _serverProcess!.stdin.writeln(jsonEncode(request));
       await _serverProcess!.stdin.flush();
       
-      // Wait for response with matching request_id
-      final responseCompleter = Completer<String>();
+      final responseCompleter = Completer<Map<String, dynamic>>();
       late StreamSubscription subscription;
       
       subscription = _responseController.stream.listen((data) {
         if (data['request_id'] == reqId) {
           subscription.cancel();
-          
-          if (data.containsKey('error')) {
-            logError('❌ Python error: ${data['error']}');
-            responseCompleter.complete(text);
-          } else {
-            final translation = data['translation'] as String;
-            
-            if (verbose && isFirstTranslation) {
-              print('   Translated: "$translation"\n');
-            }
-            
-            responseCompleter.complete(translation);
-          }
+          responseCompleter.complete(data);
         }
       });
       
-      final translation = await responseCompleter.future.timeout(
-        Duration(seconds: 30),
+      final data = await responseCompleter.future.timeout(
+        Duration(seconds: 45),
         onTimeout: () {
           subscription.cancel();
-          logError('❌ Translation timeout for request #$reqId');
-          return text;
+          logError('❌ Unified task timeout for request #$reqId');
+          return {'translation': text, 'alignments': []};
         },
       );
+      
+      if (data.containsKey('error')) {
+        logError('❌ Python error: ${data['error']}');
+        return text;
+      }
+
+      // 1. Capture the translation
+      final translation = data['translation'] as String;
+
+      // 2. Capture and parse the BERT alignments
+      final List<dynamic>? alignJson = data['alignments'];
+      if (alignJson != null && alignJson.isNotEmpty) {
+        _lastAlignments = alignJson.map((a) {
+          return Alignment(
+            (a['s'] as num).toInt(), 
+            (a['t'] as num).toInt()
+          );
+        }).toList();
+        
+        if (debug) {
+          logDebug('   [DEBUG] Received ${_lastAlignments!.length} BERT alignment links');
+        }
+      }
+
+      if (verbose && isFirstTranslation) {
+        print('   Translated: "$translation"');
+        print('   Links: $_lastAlignments\n');
+      }
       
       logProgress();
       return translation;
       
     } catch (e, stack) {
-      logError('❌ Translation failed: $e');
-      if (debug) {
-        logDebug('Stack trace:\n$stack');
-      }
+      logError('❌ Unified translation/alignment failed: $e');
+      if (debug) logDebug('Stack trace:\n$stack');
       return text;
     }
   }

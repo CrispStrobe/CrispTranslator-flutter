@@ -576,6 +576,8 @@ class DocxTranslator {
 
     if (originalText.trim().isEmpty) return;
 
+    // 1. Perform Translation
+    // The PythonNLLBONNXBackend now fetches translation AND alignments in one request
     final translatedText = await translationService.translate(
       originalText,
       targetLang,
@@ -584,21 +586,49 @@ class DocxTranslator {
 
     paraInfo.translatedText = translatedText;
 
-    if (aligner != null) {
+    // 2. Extract Alignments
+    // Strategy: First, check if the backend already provided BERT-based alignments
+    bool usedBackendAlignment = false;
+    
+    // We check if the translation service has a 'lastAlignments' property 
+    // (This works specifically with our PythonNLLBONNXBackend implementation)
+    try {
+      final dynamic service = translationService;
+      // We use a safe check here. In a strictly typed environment, 
+      // you'd use 'if (translationService is PythonNLLBONNXBackend)'
+      final backendAlignments = service.lastAlignments as List<Alignment>?;
+      
+      if (backendAlignments != null && backendAlignments.isNotEmpty) {
+        paraInfo.alignment = backendAlignments;
+        usedBackendAlignment = true;
+        _log('🔍 [DEBUG] Using BERT-based alignments from backend');
+      }
+    } catch (e) {
+      // service.lastAlignments doesn't exist or failed, fall back to heuristic
+    }
+
+    // 3. Fallback to Heuristic Aligner if backend didn't provide any
+    if (!usedBackendAlignment && aligner != null) {
       final srcWords = transPara.getWords();
       final tgtWords = _extractWords(translatedText);
 
       if (srcWords.isNotEmpty && tgtWords.isNotEmpty) {
         paraInfo.alignment = aligner!.align(srcWords, tgtWords);
-        final alignCount = paraInfo.alignment?.length ?? 0;
-        final preview = originalText.substring(
-            0, originalText.length > 40 ? 40 : originalText.length);
-        _log('ALIGN: $alignCount matches for "$preview..."');
+        _log('ℹ️ [DEBUG] Backend alignment missing, used Heuristic Aligner');
       }
+    }
+
+    if (verbose) {
+      final alignCount = paraInfo.alignment?.length ?? 0;
+      final preview = originalText.length > 40 
+          ? '${originalText.substring(0, 40)}...' 
+          : originalText;
+      _log('✨ ALIGN: $alignCount links for "$preview"');
     }
   }
 
   List<String> _extractWords(String text) {
+    // This matches words while ignoring punctuation
     final regex = RegExp(r'\w+');
     return regex.allMatches(text).map((m) => m.group(0)!).toList();
   }
@@ -719,44 +749,51 @@ XmlElement _createSimpleRun(String text) {
   ) {
     if (translatedText.trim().isEmpty) return;
 
+    // Split into words while preserving spaces/punctuation for run building
     final words = translatedText.split(' ');
     final formattedIndices = transPara.getFormattedWordIndices();
 
-    // Map clean word indices to raw word indices
-    final cleanToRaw = <int, int>{};
-    int cleanIdx = 0;
-    for (int i = 0; i < words.length; i++) {
-      if (RegExp(r'\w').hasMatch(words[i])) {
-        cleanToRaw[cleanIdx] = i;
-        cleanIdx++;
+    // Map source formatting to target words via alignment links
+    // Alignment links are usually (sourceIndex, targetIndex)
+    final targetFormatting = <int, String>{}; // Map: TargetWordIndex -> StyleType
+    
+    if (alignment != null) {
+      for (final link in alignment) {
+        final srcIdx = link.sourceIndex;
+        final tgtIdx = link.targetIndex;
+        
+        String? style;
+        if (formattedIndices['italic_bold']!.contains(srcIdx)) {
+          style = 'italic_bold';
+        } else if (formattedIndices['bold']!.contains(srcIdx)) {
+          style = 'bold';
+        } else if (formattedIndices['italic']!.contains(srcIdx)) {
+          style = 'italic';
+        }
+
+        if (style != null) {
+          // If a target word is linked to multiple source words, 
+          // we prioritize the "strongest" style (Bold-Italic > Bold > Italic)
+          final existing = targetFormatting[tgtIdx];
+          if (existing == null || 
+             (style == 'italic_bold') || 
+             (style == 'bold' && existing == 'italic')) {
+            targetFormatting[tgtIdx] = style;
+          }
+        }
       }
     }
 
     final template = transPara.runs.isNotEmpty ? transPara.runs.first : null;
 
+    // Rebuild the XML runs
     for (int i = 0; i < words.length; i++) {
+      // Re-add the space we lost during split, except for the last word
       final text = words[i] + (i < words.length - 1 ? ' ' : '');
-
-      String? style;
-      if (alignment != null && alignment.isNotEmpty) {
-        final matched = alignment
-            .where((a) => cleanToRaw[a.targetIndex] == i)
-            .map((a) => a.sourceIndex)
-            .toList();
-
-        for (final sIdx in matched) {
-          if (formattedIndices['italic_bold']!.contains(sIdx)) {
-            style = 'italic_bold';
-            break;
-          } else if (formattedIndices['bold']!.contains(sIdx)) {
-            style = 'bold';
-          } else if (formattedIndices['italic']!.contains(sIdx) &&
-              style != 'bold') {
-            style = 'italic';
-          }
-        }
-      }
-
+      
+      // Determine style for this specific word
+      final style = targetFormatting[i];
+      
       final run = _createRun(text, template, style);
       pElem.children.add(run);
     }

@@ -52,8 +52,8 @@ class AwesomeAlignTester:
 
 def run_benchmark():
     models = {
-        "FP32": "onnx_models/awesome_align/model.onnx",
-        "INT8": "onnx_models/awesome_align_int8/model.onnx"
+        "FP32": "assets/onnx_models/awesome_align/model.onnx",
+        "INT8": "assets/onnx_models/awesome_align_int8/model.onnx"
     }
     
     test_cases = [
