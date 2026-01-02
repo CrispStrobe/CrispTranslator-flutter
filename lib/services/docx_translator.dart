@@ -55,25 +55,177 @@ class Alignment {
   String toString() => '($sourceIndex,$targetIndex)';
 }
 
+// lib/services/docx_translator.dart
+// Replace the HeuristicAligner class with this improved version:
+
 class HeuristicAligner implements WordAligner {
   @override
   List<Alignment> align(List<String> sourceWords, List<String> targetWords) {
+    if (sourceWords.isEmpty || targetWords.isEmpty) return [];
+    
     final alignments = <Alignment>[];
-    final srcLower = sourceWords
-        .map((w) => w.toLowerCase().replaceAll(RegExp(r'[.,!?;:]'), ''))
-        .toList();
-    final tgtLower = targetWords
-        .map((w) => w.toLowerCase().replaceAll(RegExp(r'[.,!?;:]'), ''))
-        .toList();
-
-    for (int i = 0; i < srcLower.length; i++) {
-      for (int j = 0; j < tgtLower.length; j++) {
-        if (srcLower[i] == tgtLower[j] && srcLower[i].length > 2) {
+    final used = <int>{};
+    
+    // Normalize words for comparison
+    final srcNorm = sourceWords.map(_normalize).toList();
+    final tgtNorm = targetWords.map(_normalize).toList();
+    
+    // 1. EXACT MATCHES (highest priority)
+    for (int i = 0; i < srcNorm.length; i++) {
+      for (int j = 0; j < tgtNorm.length; j++) {
+        if (!used.contains(j) && srcNorm[i] == tgtNorm[j]) {
           alignments.add(Alignment(i, j));
+          used.add(j);
+          break;
         }
       }
     }
+    
+    // 2. SUBSTRING MATCHES (numbers, names, cognates)
+    for (int i = 0; i < srcNorm.length; i++) {
+      if (alignments.any((a) => a.sourceIndex == i)) continue;
+      
+      final src = srcNorm[i];
+      if (src.length < 3) continue;
+      
+      for (int j = 0; j < tgtNorm.length; j++) {
+        if (used.contains(j)) continue;
+        
+        final tgt = tgtNorm[j];
+        if (tgt.length < 3) continue;
+        
+        // Check if one contains the other (for compound words)
+        if (src.contains(tgt) || tgt.contains(src)) {
+          alignments.add(Alignment(i, j));
+          used.add(j);
+          break;
+        }
+        
+        // Check common prefix (length >= 4)
+        if (_commonPrefixLength(src, tgt) >= 4) {
+          alignments.add(Alignment(i, j));
+          used.add(j);
+          break;
+        }
+      }
+    }
+    
+    // 3. COGNATES AND SIMILAR WORDS (Levenshtein distance)
+    for (int i = 0; i < srcNorm.length; i++) {
+      if (alignments.any((a) => a.sourceIndex == i)) continue;
+      
+      final src = srcNorm[i];
+      if (src.length < 4) continue;
+      
+      int bestMatch = -1;
+      double bestSimilarity = 0.0;
+      
+      for (int j = 0; j < tgtNorm.length; j++) {
+        if (used.contains(j)) continue;
+        
+        final tgt = tgtNorm[j];
+        if (tgt.length < 4) continue;
+        
+        final similarity = _stringSimilarity(src, tgt);
+        if (similarity > bestSimilarity && similarity >= 0.6) {
+          bestSimilarity = similarity;
+          bestMatch = j;
+        }
+      }
+      
+      if (bestMatch >= 0) {
+        alignments.add(Alignment(i, bestMatch));
+        used.add(bestMatch);
+      }
+    }
+    
+    // 4. POSITIONAL HEURISTIC (for remaining short words)
+    for (int i = 0; i < sourceWords.length; i++) {
+      if (alignments.any((a) => a.sourceIndex == i)) continue;
+      
+      // Find closest unused target word
+      final relativePos = i / sourceWords.length;
+      final expectedTargetPos = (relativePos * targetWords.length).round();
+      
+      // Search within a window around expected position
+      final searchRadius = (targetWords.length * 0.3).toInt() + 1;
+      
+      for (int offset = 0; offset < searchRadius; offset++) {
+        for (int direction in [-1, 1]) {
+          final j = expectedTargetPos + (offset * direction);
+          if (j >= 0 && j < targetWords.length && !used.contains(j)) {
+            alignments.add(Alignment(i, j));
+            used.add(j);
+            break;
+          }
+        }
+        if (used.length > alignments.length - 1) break;
+      }
+    }
+    
     return alignments;
+  }
+  
+  String _normalize(String word) {
+    return word
+        .toLowerCase()
+        .replaceAll('#', '')
+        .trim();
+  }
+  
+  int _commonPrefixLength(String a, String b) {
+    int len = 0;
+    final minLen = a.length < b.length ? a.length : b.length;
+    for (int i = 0; i < minLen; i++) {
+      if (a[i] == b[i]) {
+        len++;
+      } else {
+        break;
+      }
+    }
+    return len;
+  }
+  
+  double _stringSimilarity(String s1, String s2) {
+    if (s1 == s2) return 1.0;
+    if (s1.isEmpty || s2.isEmpty) return 0.0;
+    
+    final len1 = s1.length;
+    final len2 = s2.length;
+    final maxLen = len1 > len2 ? len1 : len2;
+    
+    final distance = _levenshteinDistance(s1, s2);
+    return 1.0 - (distance / maxLen);
+  }
+  
+  int _levenshteinDistance(String s1, String s2) {
+    final len1 = s1.length;
+    final len2 = s2.length;
+    
+    final matrix = List.generate(
+      len1 + 1,
+      (i) => List.filled(len2 + 1, 0),
+    );
+    
+    for (int i = 0; i <= len1; i++) {
+      matrix[i][0] = i;
+    }
+    for (int j = 0; j <= len2; j++) {
+      matrix[0][j] = j;
+    }
+    
+    for (int i = 1; i <= len1; i++) {
+      for (int j = 1; j <= len2; j++) {
+        final cost = s1[i - 1] == s2[j - 1] ? 0 : 1;
+        matrix[i][j] = [
+          matrix[i - 1][j] + 1, // deletion
+          matrix[i][j - 1] + 1, // insertion
+          matrix[i - 1][j - 1] + cost, // substitution
+        ].reduce((a, b) => a < b ? a : b);
+      }
+    }
+    
+    return matrix[len1][len2];
   }
 }
 

@@ -38,6 +38,11 @@ class UnifiedTranslator:
         self.model_path = Path(model_dir).resolve()
         self.tokenizer_path = Path(tokenizer_dir).resolve()
         self.align_path = Path(aligner_dir).resolve() if aligner_dir else None
+        self.beam_size = 4
+        self.repetition_penalty = 1.2
+        self.no_repeat_ngram_size = 3
+        self.max_length = 256
+
 
         if self.verbose:
             print(f"📦 Loading ONNX model from: {self.model_path}", file=sys.stderr)
@@ -97,6 +102,17 @@ class UnifiedTranslator:
             'Ukrainian': 'ukr_Cyrl', 'Vietnamese': 'vie_Latn', 'Hindi': 'hin_Deva',
         }
 
+    def update_settings(self, beam_size=None, repetition_penalty=None, 
+                       no_repeat_ngram_size=None, max_length=None):
+        if beam_size is not None:
+            self.beam_size = beam_size
+        if repetition_penalty is not None:
+            self.repetition_penalty = repetition_penalty
+        if no_repeat_ngram_size is not None:
+            self.no_repeat_ngram_size = no_repeat_ngram_size
+        if max_length is not None:
+            self.max_length = max_length
+
     def _handle_fatal_error(self, context, exception):
         error_data = {
             "error": f"{context}: {str(exception)}",
@@ -151,11 +167,12 @@ class UnifiedTranslator:
             tokens = self.model.generate(
                 **inputs,
                 forced_bos_token_id=forced_bos_token_id,
-                max_length=256,
-                num_beams=4,               # Higher quality
-                repetition_penalty=1.2,    # Prevent repetitions
-                no_repeat_ngram_size=3     # Break hallucination loops
+                max_length=self.max_length,
+                num_beams=self.beam_size,
+                repetition_penalty=self.repetition_penalty,
+                no_repeat_ngram_size=self.no_repeat_ngram_size
             )
+
             
             translation = self.tokenizer.batch_decode(tokens, skip_special_tokens=True)[0]
 
@@ -215,9 +232,15 @@ def run_server(args):
             try:
                 request = json.loads(line)
                 
-                if request.get("command") == "shutdown":
-                    print(json.dumps({"status": "shutdown"}), flush=True)
-                    break
+                if request.get("command") == "update_settings":
+                    engine.update_settings(
+                        beam_size=request.get("beam_size"),
+                        repetition_penalty=request.get("repetition_penalty"),
+                        no_repeat_ngram_size=request.get("no_repeat_ngram_size"),
+                        max_length=request.get("max_length")
+                    )
+                    print(json.dumps({"status": "settings_updated"}), flush=True)
+                    continue
                 
                 text = request.get("text", "")
                 source = request.get("source", "English")

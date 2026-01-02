@@ -29,6 +29,7 @@ dependencies:
   # Utils
   provider: ^6.1.1
   flutter_spinkit: ^5.2.0
+  file_picker: ^8.0.0  # Cross-platform file picker
 
 dev_dependencies:
   flutter_test:
@@ -41,3 +42,5 @@ flutter:
   assets:
     - assets/models/
     - assets/onnx_models/
+    - assets/onnx_models/awesome_align_int8/
+    - assets/onnx_models/awesome_align/

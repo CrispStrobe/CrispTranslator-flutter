@@ -5,6 +5,7 @@ import 'dart:io';
 import '../translation_backend.dart';
 import '../model_paths.dart';
 import '../docx_translator.dart';
+import '../../models/app_settings.dart';
 
 class PythonNLLBONNXBackend extends TranslationBackend {
   final String scriptPath;
@@ -17,6 +18,7 @@ class PythonNLLBONNXBackend extends TranslationBackend {
   final _responseController = StreamController<Map<String, dynamic>>.broadcast();
   bool _isServerReady = false;
   int _requestId = 0;
+  AppSettings settings = AppSettings();
 
   // Store the BERT alignments from the most recent translation request
   List<Alignment>? _lastAlignments;
@@ -80,90 +82,77 @@ except ImportError:
     
     return null;
   }
+
+  Future<void> updateSettings(AppSettings newSettings) async {
+    settings = newSettings;
+    
+    if (_isServerReady && _serverProcess != null) {
+      final settingsUpdate = {
+        'command': 'update_settings',
+        'beam_size': settings.beamSize,
+        'repetition_penalty': settings.repetitionPenalty,
+        'no_repeat_ngram_size': settings.noRepeatNgramSize,
+        'max_length': settings.maxLength,
+      };
+      
+      _serverProcess!.stdin.writeln(jsonEncode(settingsUpdate));
+      await _serverProcess!.stdin.flush();
+    }
+  }
   
   @override
   Future<void> initialize() async {
+    print('🔍 [BACKEND] Starting Python backend initialization...');
+    
     final skipCheck = Platform.environment['SKIP_PYTHON_CHECK'] == '1';
     
-    logDebug('🔍 [DEBUG] Detecting Python interpreter with required packages...');
+    print('🔍 [BACKEND] Detecting Python interpreter...');
     
     if (skipCheck) {
       _pythonCommand = 'python';
-      logDebug('⚠️  Skipping Python verification (SKIP_PYTHON_CHECK=1)');
-      logDebug('   Using: $_pythonCommand');
+      print('⚠️  [BACKEND] Skipping Python verification (SKIP_PYTHON_CHECK=1)');
     } else {
+      print('🔍 [BACKEND] Searching for Python with required packages...');
       _pythonCommand = await _findWorkingPython();
       
       if (_pythonCommand == null) {
+        print('❌ [BACKEND] No suitable Python found');
         throw Exception(
-          '''
-No Python installation found with required packages.
-
-Install with: python -m pip install optimum onnxruntime transformers
-'''
+          'No Python installation found with required packages.\n\n'
+          'Install with: python -m pip install optimum onnxruntime transformers'
         );
       }
+      print('✅ [BACKEND] Found Python: $_pythonCommand');
     }
     
     // Check script
+    print('🔍 [BACKEND] Checking script at: $scriptPath');
     final scriptFile = File(scriptPath);
     if (!scriptFile.existsSync()) {
+      print('❌ [BACKEND] Script not found: $scriptPath');
       throw Exception('Script not found: $scriptPath');
     }
-    logDebug('   ✓ Script: $scriptPath');
+    print('✅ [BACKEND] Script found');
     
     // Check directories
+    print('🔍 [BACKEND] Checking model directory: $modelDir');
     if (!Directory(modelDir).existsSync()) {
+      print('❌ [BACKEND] Model directory not found: $modelDir');
       throw Exception('Model directory not found: $modelDir');
     }
-    logDebug('   ✓ Model dir: $modelDir');
+    print('✅ [BACKEND] Model directory exists');
     
+    print('🔍 [BACKEND] Checking tokenizer directory: $tokenizerDir');
     if (!Directory(tokenizerDir).existsSync()) {
+      print('❌ [BACKEND] Tokenizer directory not found: $tokenizerDir');
       throw Exception('Tokenizer directory not found: $tokenizerDir');
     }
-    logDebug('   ✓ Tokenizer dir: $tokenizerDir');
+    print('✅ [BACKEND] Tokenizer directory exists');
     
-    // Check NLLB ONNX files
-    for (final file in ModelPaths.nllbOnnxFiles) {
-      if (!File(file).existsSync()) {
-        throw Exception('Required ONNX model file not found: $file');
-      }
-    }
-    logDebug('   ✓ All ONNX model files present (${ModelPaths.nllbOnnxFiles.length})');
-    
-    // Check NLLB config/tokenizer files
-    for (final file in ModelPaths.nllbConfigFiles) {
-      if (!File(file).existsSync()) {
-        throw Exception('Required config/tokenizer file not found: $file');
-      }
-    }
-    logDebug('   ✓ All config/tokenizer files present (${ModelPaths.nllbConfigFiles.length})');
-    
-    // Check aligner directory (optional but configured)
-    if (Directory(alignerDir).existsSync()) {
-      final alignerModel = '$alignerDir/model.onnx';
-      if (File(alignerModel).existsSync()) {
-        logDebug('   ✓ Word aligner available: $alignerDir');
-      } else {
-        logDebug('   ⚠ Aligner directory exists but model.onnx missing: $alignerDir');
-      }
-    } else {
-      logDebug('   ℹ Word aligner not found: $alignerDir (optional)');
-    }
-    
-    // Check optional Awesome Align variants
-    if (ModelPaths.checkAwesomeAlignInt8()) {
-      logDebug('   ✓ Awesome Align INT8 available');
-    }
-    
-    if (ModelPaths.checkAwesomeAlignFp32()) {
-      logDebug('   ✓ Awesome Align FP32 available');
-    }
-    
-    // Start server
+    print('🔍 [BACKEND] Starting Python server...');
     await _startServer();
     
-    logInfo('✅ Python NLLB ONNX backend initialized (using: $_pythonCommand)');
+    print('✅ [BACKEND] Python backend fully initialized!');
   }
   
   Future<void> _startServer() async {
