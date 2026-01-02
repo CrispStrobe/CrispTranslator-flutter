@@ -282,6 +282,8 @@ class _TranslatorPageState extends State<TranslatorPage> with SingleTickerProvid
         _textController.text,
         _targetLanguage,
         sourceLanguage: _sourceLanguage,
+        beamSize: _settings.useBeamSearch ? _settings.beamSize : 1,
+        maxLength: _settings.maxLength,
       );
 
       if (mounted) {

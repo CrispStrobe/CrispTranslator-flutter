@@ -42,7 +42,7 @@ class _SettingsPageState extends State<SettingsPage> {
       body: ListView(
         padding: const EdgeInsets.all(16),
         children: [
-          // Presets
+          // 1. Quality Presets
           Card(
             child: Padding(
               padding: const EdgeInsets.all(16),
@@ -59,6 +59,9 @@ class _SettingsPageState extends State<SettingsPage> {
                       Expanded(
                         child: ElevatedButton(
                           onPressed: () => _applyPreset(AppSettings.speed()),
+                          style: ElevatedButton.styleFrom(
+                            backgroundColor: !_settings.useBeamSearch ? Colors.blue.shade50 : null,
+                          ),
                           child: const Column(
                             children: [
                               Icon(Icons.speed),
@@ -73,6 +76,10 @@ class _SettingsPageState extends State<SettingsPage> {
                       Expanded(
                         child: ElevatedButton(
                           onPressed: () => _applyPreset(AppSettings.balanced()),
+                          style: ElevatedButton.styleFrom(
+                            backgroundColor: (_settings.useBeamSearch && _settings.beamSize == 2) 
+                                ? Colors.blue.shade50 : null,
+                          ),
                           child: const Column(
                             children: [
                               Icon(Icons.balance),
@@ -87,6 +94,10 @@ class _SettingsPageState extends State<SettingsPage> {
                       Expanded(
                         child: ElevatedButton(
                           onPressed: () => _applyPreset(AppSettings.quality()),
+                          style: ElevatedButton.styleFrom(
+                            backgroundColor: (_settings.useBeamSearch && _settings.beamSize == 4) 
+                                ? Colors.blue.shade50 : null,
+                          ),
                           child: const Column(
                             children: [
                               Icon(Icons.high_quality),
@@ -106,7 +117,7 @@ class _SettingsPageState extends State<SettingsPage> {
           
           const SizedBox(height: 16),
           
-          // Performance Settings
+          // 2. Performance Settings
           Card(
             child: Padding(
               padding: const EdgeInsets.all(16),
@@ -118,17 +129,42 @@ class _SettingsPageState extends State<SettingsPage> {
                     style: Theme.of(context).textTheme.titleLarge,
                   ),
                   const SizedBox(height: 16),
-                  
-                  _buildSlider(
-                    'Beam Size',
-                    '${_settings.beamSize}',
-                    _settings.beamSize.toDouble(),
-                    1, 4,
-                    (value) => setState(() => _settings.beamSize = value.toInt()),
-                    subtitle: _settings.beamSize == 1 
-                      ? 'Greedy search (fastest)'
-                      : '${_settings.beamSize} beams (better quality)',
+
+                  // Beam Search Master Toggle
+                  SwitchListTile(
+                    title: const Text('Use Beam Search'),
+                    subtitle: const Text('Explores multiple translation paths for higher accuracy'),
+                    value: _settings.useBeamSearch,
+                    onChanged: (value) {
+                      setState(() {
+                        _settings.useBeamSearch = value;
+                        // If turning on, default to at least 2 beams; if off, set to 1 (Greedy)
+                        if (value && _settings.beamSize < 2) _settings.beamSize = 2;
+                        if (!value) _settings.beamSize = 1;
+                      });
+                    },
                   ),
+                  
+                  const Divider(),
+                  
+                  // Contextual Beam Size Slider
+                  if (_settings.useBeamSearch)
+                    _buildSlider(
+                      'Beam Size',
+                      '${_settings.beamSize}',
+                      _settings.beamSize.toDouble(),
+                      2, 4,
+                      (value) => setState(() => _settings.beamSize = value.toInt()),
+                      subtitle: 'Higher values improve quality but increase latency',
+                    )
+                  else
+                    const Padding(
+                      padding: EdgeInsets.symmetric(vertical: 8.0, horizontal: 16.0),
+                      child: Text(
+                        'Currently using Greedy Search (Fastest)',
+                        style: TextStyle(color: Colors.grey, fontStyle: FontStyle.italic),
+                      ),
+                    ),
                   
                   _buildSlider(
                     'Repetition Penalty',
@@ -163,7 +199,7 @@ class _SettingsPageState extends State<SettingsPage> {
           
           const SizedBox(height: 16),
           
-          // UI Settings
+          // 3. UI/Display Settings
           Card(
             child: Padding(
               padding: const EdgeInsets.all(16),

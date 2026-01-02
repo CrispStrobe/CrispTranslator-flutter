@@ -2,6 +2,7 @@
 class AppSettings {
   // Performance settings
   int beamSize;
+  bool useBeamSearch;
   double repetitionPenalty;
   int noRepeatNgramSize;
   int maxLength;
@@ -15,6 +16,7 @@ class AppSettings {
   
   AppSettings({
     this.beamSize = 4,
+    this.useBeamSearch = true,
     this.repetitionPenalty = 1.2,
     this.noRepeatNgramSize = 3,
     this.maxLength = 256,
@@ -26,17 +28,20 @@ class AppSettings {
   factory AppSettings.speed() => AppSettings(
     beamSize: 1,
     repetitionPenalty: 1.0,
+    useBeamSearch: false,
     maxLength: 128,
   );
   
   factory AppSettings.quality() => AppSettings(
     beamSize: 4,
+    useBeamSearch: true,
     repetitionPenalty: 1.2,
     maxLength: 256,
   );
   
   factory AppSettings.balanced() => AppSettings(
     beamSize: 2,
+    useBeamSearch: true,
     repetitionPenalty: 1.1,
     maxLength: 200,
   );

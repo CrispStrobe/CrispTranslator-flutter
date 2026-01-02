@@ -1,8 +1,32 @@
+// lib/services/onnx_translation_service.dart:
+
 import 'dart:typed_data';
 import 'package:flutter/services.dart';
 import 'package:onnxruntime/onnxruntime.dart';
 import 'nllb_tokenizer.dart';
 import 'dart:io';
+import 'dart:math' as math;
+
+/// Represents a single candidate path in the Beam Search tree.
+class BeamHypothesis {
+  final List<int> tokens;
+  final double score;
+  final Map<String, OrtValue> decoderKVs;
+  bool isFinished;
+
+  BeamHypothesis({
+    required this.tokens,
+    required this.score,
+    required this.decoderKVs,
+    this.isFinished = false,
+  });
+
+  /// Safely releases all ONNX tensors associated with this branch.
+  void dispose() {
+    decoderKVs.forEach((_, value) => value.release());
+    decoderKVs.clear();
+  }
+}
 
 class ONNXTranslationService {
   OrtSession? _encoderSession;
@@ -88,69 +112,221 @@ class ONNXTranslationService {
     }
   }
 
-  Future<String> translate(
-  String text,
-  String targetLanguage, {
-  String sourceLanguage = 'English',
-}) async {
-  if (!_isInitialized) throw StateError('Service not initialized');
-
-  final startTime = DateTime.now();
-  print('\n' + '=' * 70);
-  print('🔤 Translation: "$text"');
-  print('   $sourceLanguage → $targetLanguage');
-  print('=' * 70);
-
-  try {
-    // 1. Tokenize with source language
-    final tokStart = DateTime.now();
-    final encoding = _tokenizer!.encode(text, sourceLanguage: sourceLanguage);
-
-    print('\n--- CROSS-CHECK LOG (DART vs PYTHON) ---');
-    print('DART Encoder IDs:   ${encoding.inputIds.take(15).toList()}');
+  /// CORE BEAM SEARCH DECODER
+  Future<List<int>> _runDecoderBeamSearch(
+    OrtValue encoderOutput,
+    TokenizerOutput encoding,
+    String targetLanguage, {
+    int beamSize = 4,
+    int maxLength = 128,
+  }) async {
     final targetLangId = _tokenizer!.getLanguageTokenId(targetLanguage);
-    print('DART Source Lang: $sourceLanguage');
-    print('DART Target Lang ID: $targetLangId');
+    final int encoderSeqLen = (encoderOutput.value as List)[0].length;
+    final fullEncoderMask = Int64List.fromList(encoding.attentionMask.map((e) => e.toInt()).toList());
 
-    final actualLength = encoding.attentionMask.where((m) => m == 1).length;
-    print('📝 Tokens: $actualLength (${DateTime.now().difference(tokStart).inMilliseconds}ms)');
+    // Initialize with Lang ID (BOS + Language Tag)
+    List<BeamHypothesis> beams = [
+      BeamHypothesis(
+        tokens: [2, targetLangId],
+        score: 0.0,
+        decoderKVs: {},
+      )
+    ];
 
-    // ✅ Calculate dynamic max length based on input
-    final dynamicMaxLength = _calculateMaxLength(actualLength);
-    print('📏 [DECODER] Dynamic max_length: $dynamicMaxLength (input: $actualLength)');
+    for (int step = 0; step < maxLength; step++) {
+      List<BeamHypothesis> candidates = [];
 
-    // 2. Run encoder
-    final encStart = DateTime.now();
-    final encoderOutput = await _runEncoder(encoding);
-    print('🔄 Encoder: ${DateTime.now().difference(encStart).inMilliseconds}ms');
+      for (var beam in beams) {
+        if (beam.isFinished) {
+          candidates.add(beam);
+          continue;
+        }
 
-    // 3. Run decoder with dynamic max length
-    final decStart = DateTime.now();
-    final outputIds = await _runDecoderWithCache(
-      encoderOutput,
-      encoding,
-      targetLanguage,
-      maxLength: dynamicMaxLength, // ✅ Pass dynamic length
-    );
-    print('🔄 Decoder: ${DateTime.now().difference(decStart).inMilliseconds}ms');
+        final bool isStep0 = step == 0;
+        final session = isStep0 ? _decoderSession! : _decoderWithPastSession!;
+        final currentInputIds = isStep0 ? beam.tokens : [beam.tokens.last];
 
-    // 4. Detokenize
-    final detokStart = DateTime.now();
-    final translation = _tokenizer!.decode(outputIds);
-    print('📝 Detokenize: ${DateTime.now().difference(detokStart).inMilliseconds}ms');
+        final idTensor = OrtValueTensor.createTensorWithDataList(
+            Int64List.fromList(currentInputIds), [1, currentInputIds.length]);
+        final maskTensor = OrtValueTensor.createTensorWithDataList(fullEncoderMask, [1, encoderSeqLen]);
 
-    final totalTime = DateTime.now().difference(startTime).inMilliseconds;
-    print('✅ Total: ${totalTime}ms');
-    print('   Result: "$translation"');
-    print('=' * 70 + '\n');
+        final inputs = <String, OrtValue>{
+          'input_ids': idTensor,
+          'encoder_attention_mask': maskTensor,
+        };
 
-    return translation;
-  } catch (e, stack) {
-    print('❌ Translation failed: $e');
-    print(stack);
-    rethrow;
+        if (isStep0) {
+          inputs['encoder_hidden_states'] = encoderOutput;
+        } else {
+          inputs.addAll(beam.decoderKVs);
+          // Note: encoder KVs are typically static and handled within the session
+        }
+
+        final outputs = await session.runAsync(OrtRunOptions(), inputs);
+        if (outputs == null) continue;
+
+        final logitsValue = outputs[0]!;
+        final List logits = (logitsValue.value as List)[0][currentInputIds.length - 1];
+
+        // 🛡️ Log-Softmax for numerical stability
+        final logProbs = _computeLogSoftmax(logits);
+        final topKIndices = _getTopK(logProbs, beamSize);
+
+        for (int nextToken in topKIndices) {
+          final nextScore = beam.score + logProbs[nextToken];
+          final nextTokens = List<int>.from(beam.tokens)..add(nextToken);
+          
+          // Map present KVs to past KVs for the next step
+          final nextKVs = _extractKVs(outputs, session.outputNames);
+
+          candidates.add(BeamHypothesis(
+            tokens: nextTokens,
+            score: nextScore,
+            decoderKVs: nextKVs,
+            isFinished: nextToken == 2, // EOS
+          ));
+        }
+
+        // Cleanup temporary tensors for this specific branch step
+        idTensor.release();
+        maskTensor.release();
+        logitsValue.release();
+        // If we were using past KVs, we can't release them until we know which beam won
+      }
+
+      // Sort candidates by score (best first)
+      candidates.sort((a, b) => b.score.compareTo(a.score));
+
+      // 🧹 Pruning: Keep only top beams and dispose of the others
+      final oldBeams = beams;
+      beams = candidates.take(beamSize).toList();
+
+      // Dispose only of hypotheses that didn't make the cut
+      for (var cand in candidates.skip(beamSize)) {
+        cand.dispose();
+      }
+      // Dispose of old beam KVs as they've been cycled into new candidate KVs
+      for (var oldBeam in oldBeams) {
+        if (!beams.contains(oldBeam)) oldBeam.dispose();
+      }
+
+      if (beams.every((b) => b.isFinished)) break;
+    }
+
+    final bestBeam = beams.first;
+    final result = List<int>.from(bestBeam.tokens.sublist(2));
+
+    // Final Memory Cleanup
+    for (var b in beams) {
+      b.dispose();
+    }
+
+    return result;
   }
-}
+
+  /// Numerically stable Log-Softmax implementation
+  List<double> _computeLogSoftmax(List logits) {
+    double maxLogit = logits.map((e) => (e as num).toDouble()).reduce((a, b) => a > b ? a : b);
+    double sumExp = logits.map((e) => math.exp((e as num).toDouble() - maxLogit)).reduce((a, b) => a + b);
+    double logSumExp = maxLogit + math.log(sumExp);
+    return logits.map((e) => (e as num).toDouble() - logSumExp).toList();
+  }
+
+  List<int> _getTopK(List<double> probs, int k) {
+    final indexed = probs.asMap().entries.toList();
+    indexed.sort((a, b) => b.value.compareTo(a.value));
+    return indexed.take(k).map((e) => e.key).toList();
+  }
+
+  Map<String, OrtValue> _extractKVs(List<OrtValue?> outputs, List<String> names) {
+    final kvs = <String, OrtValue>{};
+    for (int i = 1; i < outputs.length; i++) {
+      final name = names[i].replaceFirst('present', 'past_key_values');
+      kvs[name] = outputs[i]!; 
+    }
+    return kvs;
+  }
+
+  /// Public translation entry point with beam search logic branching.
+  Future<String> translate(
+    String text,
+    String targetLanguage, {
+    String sourceLanguage = 'English',
+    int beamSize = 1, // ✅ Passed from AppSettings
+    int? maxLength,   // If null, will be dynamically calculated
+  }) async {
+    if (!_isInitialized) throw StateError('Service not initialized');
+
+    final startTime = DateTime.now();
+    print('\n' + '=' * 70);
+    print('🔤 Translation: "$text"');
+    print('   $sourceLanguage → $targetLanguage (Beams: $beamSize)'); 
+    print('=' * 70);
+
+    try {
+      // 1. Tokenize with source language
+      final tokStart = DateTime.now();
+      final encoding = _tokenizer!.encode(text, sourceLanguage: sourceLanguage);
+
+      print('\n--- CROSS-CHECK LOG (DART vs PYTHON) ---');
+      print('DART Encoder IDs:   ${encoding.inputIds.take(15).toList()}');
+      final targetLangId = _tokenizer!.getLanguageTokenId(targetLanguage);
+      print('DART Source Lang: $sourceLanguage');
+      print('DART Target Lang ID: $targetLangId');
+
+      final actualLength = encoding.attentionMask.where((m) => m == 1).length;
+      print('📝 Tokens: $actualLength (${DateTime.now().difference(tokStart).inMilliseconds}ms)');
+
+      // ✅ Calculate dynamic max length based on input
+      final dynamicMaxLength = maxLength ?? _calculateMaxLength(actualLength);
+      print('📏 [DECODER] Dynamic max_length: $dynamicMaxLength (input: $actualLength)');
+
+      // 2. Run encoder
+      final encStart = DateTime.now();
+      final encoderOutput = await _runEncoder(encoding);
+      print('🔄 Encoder: ${DateTime.now().difference(encStart).inMilliseconds}ms');
+
+      // 3. Logic Branching: Beam Search vs. Greedy with Cache
+      final decStart = DateTime.now();
+      List<int> outputIds;
+
+      if (beamSize > 1) {
+        print('🚀 [DECODER] Running Full Beam Search (Size: $beamSize)...');
+        outputIds = await _runDecoderBeamSearch(
+          encoderOutput!,
+          encoding,
+          targetLanguage,
+          beamSize: beamSize,
+          maxLength: dynamicMaxLength,
+        );
+      } else {
+        print('⚡ [DECODER] Running Greedy Search with KV Cache...');
+        outputIds = await _runDecoderWithCache(
+          encoderOutput,
+          encoding,
+          targetLanguage,
+          maxLength: dynamicMaxLength,
+        );
+      }
+      print('🔄 Decoder: ${DateTime.now().difference(decStart).inMilliseconds}ms');
+
+      // 4. Detokenize
+      final detokStart = DateTime.now();
+      final translation = _tokenizer!.decode(outputIds);
+      print('📝 Detokenize: ${DateTime.now().difference(detokStart).inMilliseconds}ms');
+
+      final totalTime = DateTime.now().difference(startTime).inMilliseconds;
+      print('✅ Total: ${totalTime}ms');
+      print('   Result: "$translation"');
+      print('=' * 70 + '\n');
+
+      return translation;
+    } catch (e, stack) {
+      print('❌ Translation failed: $e');
+      print(stack);
+      rethrow;
+    }
+  }
 
 // Calculate appropriate max length
 int _calculateMaxLength(int inputLength) {

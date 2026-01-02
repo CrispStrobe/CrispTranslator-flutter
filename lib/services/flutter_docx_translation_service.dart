@@ -6,12 +6,12 @@ import 'package:xml/xml.dart';
 import 'dart:convert';
 import 'docx_translator.dart';
 import 'onnx_translation_service.dart';
-import 'onnx_bert_aligner.dart'; // ADD THIS
+import 'onnx_bert_aligner.dart'; 
 
 class FlutterDocxTranslationService {
   final ONNXTranslationService onnxService;
   final bool verbose;
-  ONNXBertAligner? _aligner; // ADD THIS
+  ONNXBertAligner? _aligner; 
   
   FlutterDocxTranslationService({
     required this.onnxService,
@@ -331,39 +331,61 @@ Future<void> _translateParagraph(
   WordAligner aligner,
   Function(String translated, List<Alignment> alignments) onComplete,
 ) async {
-  // Extract with formatting
   final transPara = translator.extractParagraph(paraElem);
-  final originalText = transPara.getText();
+  final fullOriginalText = transPara.getText();
   
-  // Translate
-  final translatedText = await onnxService.translate(
-    originalText,
-    targetLang,
-    sourceLanguage: sourceLang,
-  );
-  
-  print('📝 [PARA] Translated: "${translatedText.substring(0, translatedText.length > 60 ? 60 : translatedText.length)}..."');
-  
-  // Get alignments
-  final srcCleanWords = transPara.getWords();
-  final tgtCleanWords = RegExp(r'[\p{L}\p{N}]+', unicode: true)
-      .allMatches(translatedText)
-      .map((m) => m.group(0)!)
-      .toList();
+  if (fullOriginalText.trim().isEmpty) return;
 
-  print('🔗 [PARA] Aligning: ${srcCleanWords.length} → ${tgtCleanWords.length}');
-  final alignments = aligner.align(srcCleanWords, tgtCleanWords);
-  print('🔗 [PARA] Got ${alignments.length} alignments');
+  // 1. SENTENCE SPLITTING
+  final sentenceRegex = RegExp(r'(?<=[.!?])\s+');
+  final sentences = fullOriginalText.split(sentenceRegex).where((s) => s.trim().isNotEmpty).toList();
   
-  // Reconstruct with aligned formatting
+  List<String> translatedSentences = [];
+  List<Alignment> globalAlignments = [];
+  int srcWordOffset = 0;
+  int tgtWordOffset = 0;
+
+  print('🧩 [PARA] Splitting into ${sentences.length} sentences for NMT stability.');
+
+  for (var sentence in sentences) {
+    // 2. NEURAL TRANSLATION (Per Sentence)
+    final translatedSent = await onnxService.translate(
+      sentence,
+      targetLang,
+      sourceLanguage: sourceLang,
+    );
+    translatedSentences.add(translatedSent);
+
+    // 3. OFFSET-AWARE ALIGNMENT
+    final sWords = RegExp(r'[\p{L}\p{N}]+', unicode: true)
+        .allMatches(sentence).map((m) => m.group(0)!).toList();
+    final tWords = RegExp(r'[\p{L}\p{N}]+', unicode: true)
+        .allMatches(translatedSent).map((m) => m.group(0)!).toList();
+    
+    if (sWords.isNotEmpty && tWords.isNotEmpty) {
+      final localAligns = aligner.align(sWords, tWords);
+      for (var a in localAligns) {
+        globalAlignments.add(Alignment(
+          a.sourceIndex + srcWordOffset,
+          a.targetIndex + tgtWordOffset,
+        ));
+      }
+      srcWordOffset += sWords.length;
+      tgtWordOffset += tWords.length;
+    }
+  }
+
+  final finalFullTranslation = translatedSentences.join(' ');
+
+  // 4. RECONSTRUCT WITH CLONED NODES (Prevents XmlParentException)
   translator.applyAlignedFormatting(
     paraElem,
     transPara,
-    translatedText,
-    alignments,
+    finalFullTranslation,
+    globalAlignments,
   );
   
-  onComplete(translatedText, alignments);
+  onComplete(finalFullTranslation, globalAlignments);
 }
 
 
