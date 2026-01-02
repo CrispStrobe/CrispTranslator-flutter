@@ -4,6 +4,7 @@ import 'package:archive/archive.dart';
 import 'package:xml/xml.dart';
 import 'dart:convert';
 import 'backends/python_nllb_onnx_backend.dart';
+import 'dart:math' as math;
 
 // ============================================================================
 // TRANSLATION INTERFACE
@@ -50,6 +51,10 @@ class Alignment {
   final int targetIndex;
 
   Alignment(this.sourceIndex, this.targetIndex);
+  
+  // Aliases for compatibility
+  int get source => sourceIndex;
+  int get target => targetIndex;
 
   @override
   String toString() => '($sourceIndex,$targetIndex)';
@@ -241,7 +246,7 @@ class FormatRun {
   String? fontName;
   double? fontSize;
   RGBColor? fontColor;
-  // Preservation of unknown XML nodes (e.g., highlighting, superscript, etc.)
+  // for preserving unknown XML like highlighting
   List<XmlNode> extraProperties; 
 
   FormatRun({
@@ -279,72 +284,98 @@ class RGBColor {
 }
 
 class TranslatableParagraph {
-  List<FormatRun> runs;
-  Map<String, dynamic> metadata;
-
+  final List<FormatRun> runs;
+  final Map<String, dynamic> metadata;
+  
   TranslatableParagraph({
-    List<FormatRun>? runs,
+    required this.runs,
     Map<String, dynamic>? metadata,
-  })  : runs = runs ?? [],
-        metadata = metadata ?? {};
-
-  String getText() => runs.map((r) => r.text).join();
-
+  }) : metadata = metadata ?? {};
+  
+  // CRITICAL: Get full text
+  String getText() {
+    return runs.map((r) => r.text).join('');
+  }
+  
+  // CRITICAL: Get CLEAN words (alphanumeric only, matching Python's re.findall(r"\w+"))
   List<String> getWords() {
-    // Extract alphanumeric words only (like Python's re.findall(r"\w+"))
     final text = getText();
-    final regex = RegExp(r'\w+');
+    // ✅ Unicode-aware regex: matches letters (including umlauts) + digits
+    final regex = RegExp(r'[\p{L}\p{N}]+', unicode: true);
     return regex.allMatches(text).map((m) => m.group(0)!).toList();
   }
-
+  
+  // CRITICAL: Map clean word indices to formatting
   Map<String, Set<int>> getFormattedWordIndices() {
+    print('🔍 [DEBUG] getFormattedWordIndices() START');
+    
     final formatted = {
       'italic': <int>{},
       'bold': <int>{},
       'italic_bold': <int>{},
     };
-
+    
     final text = getText();
-    final words = getWords();
-
-    if (words.isEmpty) return formatted;
-
-    // Build character-to-word mapping
+    final words = getWords(); // Clean words only
+    
+    if (words.isEmpty) {
+      print('⚠️  [DEBUG] No words extracted');
+      return formatted;
+    }
+    
+    print('🔍 [DEBUG] Full text: "$text"');
+    print('🔍 [DEBUG] Clean words: $words');
+    
+    // Build char position → word index map
     final charToWord = <int, int>{};
     int lastFound = 0;
+    
     for (int wordIdx = 0; wordIdx < words.length; wordIdx++) {
       final word = words[wordIdx];
       final start = text.indexOf(word, lastFound);
+      
       if (start != -1) {
         for (int i = start; i < start + word.length; i++) {
           charToWord[i] = wordIdx;
         }
         lastFound = start + word.length;
+        print('🔍 [DEBUG] Word[$wordIdx] "$word" → chars $start-${start + word.length - 1}');
       }
     }
-
-    // Map formatting to word indices
+    
+    // Walk through runs and mark formatted word indices
     int charPos = 0;
     for (final run in runs) {
       if (run.text.isEmpty) continue;
-
-      for (final char in run.text.runes) {
+      
+      for (int i = 0; i < run.text.length; i++) {
+        final char = run.text[i];
+        
         if (charToWord.containsKey(charPos)) {
           final wordIdx = charToWord[charPos]!;
-          if (String.fromCharCode(char).trim().isNotEmpty) {
+          
+          if (!char.trim().isEmpty) { // Only non-whitespace
             if (run.bold == true && run.italic == true) {
               formatted['italic_bold']!.add(wordIdx);
+              print('🔍 [DEBUG] Word[$wordIdx] = BOLD+ITALIC');
             } else if (run.italic == true) {
               formatted['italic']!.add(wordIdx);
+              print('🔍 [DEBUG] Word[$wordIdx] = ITALIC');
             } else if (run.bold == true) {
               formatted['bold']!.add(wordIdx);
+              print('🔍 [DEBUG] Word[$wordIdx] = BOLD');
             }
           }
         }
         charPos++;
       }
     }
-
+    
+    print('🔍 [DEBUG] Final formatting map:');
+    print('  Bold: ${formatted['bold']}');
+    print('  Italic: ${formatted['italic']}');
+    print('  Bold+Italic: ${formatted['italic_bold']}');
+    
     return formatted;
   }
 }
@@ -367,7 +398,7 @@ class DocxTranslator {
   DocxTranslator({
     required this.translationService,
     this.aligner,
-    this.verbose = false,
+    this.verbose = true,
   });
 
 
@@ -375,6 +406,18 @@ class DocxTranslator {
   // MAIN TRANSLATION WORKFLOW
   // ============================================================================
 
+  void _traceAlignments(List<String> srcWords, List<String> tgtWords, List<Alignment> links) {
+    print('║ ALIGN TRACE | Links: ${links.length}');
+    for (var link in links) {
+      if (link.sourceIndex < srcWords.length && link.targetIndex < tgtWords.length) {
+        String src = srcWords[link.sourceIndex];
+        String tgt = tgtWords[link.targetIndex];
+        // "word -> word" debug log
+        _log('║   Link: [$src] (${link.sourceIndex}) ↔ [$tgt] (${link.targetIndex})');
+      }
+    }
+  }
+  
   Future<Uint8List> translateDocument({
     required Uint8List docxBytes,
     required String targetLanguage,
@@ -583,33 +626,140 @@ class DocxTranslator {
         : 'ℹ Footers require separate file parsing');
   }
 
-  TranslatableParagraph _extractParagraph(XmlElement pElem) {
+  TranslatableParagraph extractParagraph(XmlElement paraElem) {
+    return _extractParagraph(paraElem);
+  }
+  
+  TranslatableParagraph _extractParagraph(XmlElement paraElem) {
+    print('📖 [DEBUG] extractParagraph() START');
+    
     final runs = <FormatRun>[];
     String? resolvedBaseFont;
     
-    // Resolve the "Base Font" (Matching Python's font hierarchy logic)
-    for (final r in pElem.descendants.whereType<XmlElement>().where((e) => e.name.local == 'r')) {
-      final rPr = r.findElements('rPr', namespace: wNamespace).firstOrNull;
-      final rFonts = rPr?.findElements('rFonts', namespace: wNamespace).firstOrNull;
-      resolvedBaseFont = rFonts?.getAttribute('ascii', namespace: wNamespace) ?? 
-                         rFonts?.getAttribute('hAnsi', namespace: wNamespace);
-      if (resolvedBaseFont != null) break;
-    }
-    resolvedBaseFont ??= "Times New Roman";
-
-    for (final rElem in pElem.children.whereType<XmlElement>().where((e) => e.name.local == 'r')) {
-      // Skip footnote anchors during extraction (we re-attach them later)
-      bool isAnchor = rElem.descendants.any((d) => 
-        d is XmlElement && (d.name.local == 'footnoteReference' || d.name.local == 'footnoteRef'));
+    // Extract all runs
+    final runElements = paraElem.findAllElements('w:r').toList();
+    print('🔍 [DEBUG] Found ${runElements.length} runs');
+    
+    for (int i = 0; i < runElements.length; i++) {
+      final runElem = runElements[i];
+      final textElem = runElem.findElements('w:t').firstOrNull;
       
-      if (!isAnchor) {
-        final text = _extractRunText(rElem);
-        if (text.isNotEmpty) {
-          runs.add(_extractRunFormatting(rElem, text, resolvedBaseFont));
+      if (textElem == null) continue;
+      
+      final text = textElem.innerText;
+      if (text.isEmpty) continue;
+      
+      // Extract formatting from rPr
+      final rPr = runElem.findElements('w:rPr').firstOrNull;
+      
+      bool? bold;
+      bool? italic;
+      bool? underline;
+      String? fontName;
+      double? fontSize;
+      RGBColor? fontColor; 
+      
+      if (rPr != null) {
+        // Bold
+        final boldElem = rPr.findElements('w:b').firstOrNull;
+        if (boldElem != null) {
+          final val = boldElem.getAttribute('w:val');
+          bold = (val == null || val == '1' || val == 'true');
+        }
+        
+        // Italic
+        final italicElem = rPr.findElements('w:i').firstOrNull;
+        if (italicElem != null) {
+          final val = italicElem.getAttribute('w:val');
+          italic = (val == null || val == '1' || val == 'true');
+        }
+        
+        // Underline
+        final uElem = rPr.findElements('w:u').firstOrNull;
+        if (uElem != null) {
+          underline = true;
+        }
+        
+        // Font name from rFonts
+        final rFonts = rPr.findElements('w:rFonts').firstOrNull;
+        if (rFonts != null) {
+          fontName = rFonts.getAttribute('w:ascii') ?? 
+                     rFonts.getAttribute('w:hAnsi');
+        }
+        
+        // Font size from sz (half-points, so divide by 2)
+        final szElem = rPr.findElements('w:sz').firstOrNull;
+        if (szElem != null) {
+          final szVal = szElem.getAttribute('w:val');
+          if (szVal != null) {
+            fontSize = double.tryParse(szVal)! / 2.0;
+          }
+        }
+        
+        // Font color - CONVERT to RGBColor
+        final colorElem = rPr.findElements('w:color').firstOrNull;
+        if (colorElem != null) {
+          final colorHex = colorElem.getAttribute('w:val');
+          if (colorHex != null && colorHex != 'auto') {
+            try {
+              fontColor = RGBColor.fromHex(colorHex);  // ✅ CONVERT
+            } catch (e) {
+              print('⚠️  [DEBUG] Invalid color value: $colorHex');
+            }
+          }
         }
       }
+      
+      // Resolve base font (first run with font wins)
+      if (resolvedBaseFont == null && fontName != null) {
+        resolvedBaseFont = fontName;
+      }
+      
+      final formatRun = FormatRun(
+        text: text,
+        bold: bold,
+        italic: italic,
+        underline: underline,
+        fontName: fontName ?? resolvedBaseFont ?? 'Calibri',
+        fontSize: fontSize ?? 11.0,
+        fontColor: fontColor,
+      );
+      
+      runs.add(formatRun);
+      
+      print('🔍 [DEBUG] Run[$i]: "${text.substring(0, text.length > 20 ? 20 : text.length)}" | B:$bold I:$italic F:${formatRun.fontName}');
     }
-    return TranslatableParagraph(runs: runs);
+    
+    final transPara = TranslatableParagraph(runs: runs);
+    
+    // Store paragraph-level metadata
+    final pPr = paraElem.findElements('w:pPr').firstOrNull;
+    if (pPr != null) {
+      final jc = pPr.findElements('w:jc').firstOrNull;
+      if (jc != null) {
+        transPara.metadata['alignment'] = jc.getAttribute('w:val');
+      }
+      
+      // Indentation
+      final ind = pPr.findElements('w:ind').firstOrNull;
+      if (ind != null) {
+        transPara.metadata['indLeft'] = ind.getAttribute('w:left');
+        transPara.metadata['indRight'] = ind.getAttribute('w:right');
+        transPara.metadata['indFirstLine'] = ind.getAttribute('w:firstLine');
+      }
+      
+      // Spacing
+      final spacing = pPr.findElements('w:spacing').firstOrNull;
+      if (spacing != null) {
+        transPara.metadata['spaceBefore'] = spacing.getAttribute('w:before');
+        transPara.metadata['spaceAfter'] = spacing.getAttribute('w:after');
+        transPara.metadata['lineRule'] = spacing.getAttribute('w:lineRule');
+        transPara.metadata['line'] = spacing.getAttribute('w:line');
+      }
+    }
+    
+    print('📖 [DEBUG] Extracted ${runs.length} runs, text length: ${transPara.getText().length}');
+    return transPara;
   }
 
   String _extractRunText(XmlElement rElem) {
@@ -652,6 +802,8 @@ class DocxTranslator {
     }
     return formatRun;
   }
+
+  
 
   void _extractParagraphProperties(
       XmlElement pPr, Map<String, dynamic> metadata) {
@@ -698,54 +850,74 @@ class DocxTranslator {
     final originalText = paraInfo.transPara.getText();
     if (originalText.trim().isEmpty) return;
 
-    // 1. Sentence Splitting (Matches Python Blueprint Step 1)
+    // 1. SENTENCE SPLITTING (Python Blueprint Step 1)
+    // We split while preserving the punctuation to ensure we don't lose characters
     final sentenceRegex = RegExp(r'(?<=[.!?])\s+');
     final sentences = originalText.split(sentenceRegex).where((s) => s.trim().isNotEmpty).toList();
     
     List<String> translatedSentences = [];
-    List<Alignment> combinedAlignments = [];
-    int sourceWordOffset = 0;
-    int targetWordOffset = 0;
+    List<Alignment> globalAlignments = [];
+    
+    int srcWordOffset = 0;
+    int tgtWordOffset = 0;
 
-    for (var s in sentences) {
-      final t = await translationService.translate(s, targetLang, sourceLang);
-      translatedSentences.add(t);
+    for (var sentence in sentences) {
+      // 2. NEURAL TRANSLATION
+      final translatedSent = (await translationService.translate(sentence, targetLang, sourceLang))
+        .replaceAll(RegExp(r'\s+'), ' ') // Collapse multiple spaces to one
+        .trim();
+      translatedSentences.add(translatedSent);
 
-      // 2. Alignment Offset Management
-      if (translationService is PythonNLLBONNXBackend) {
-        final backend = translationService as PythonNLLBONNXBackend;
-        final currentAligns = backend.lastAlignments;
+      // 3. OFFSET-AWARE ALIGNMENT (Python Blueprint Step 4)
+      if (aligner != null) {
+        final sWords = _extractWords(sentence);
+        final tWords = _extractWords(translatedSent);
         
-        if (currentAligns != null) {
-          for (var a in currentAligns) {
-            combinedAlignments.add(Alignment(
-              a.sourceIndex + sourceWordOffset,
-              a.targetIndex + targetWordOffset,
+        if (sWords.isNotEmpty && tWords.isNotEmpty) {
+          final localAligns = aligner!.align(sWords, tWords);
+          
+          // Shift indices based on the cumulative word count of previous sentences
+          for (var a in localAligns) {
+            globalAlignments.add(Alignment(
+              a.sourceIndex + srcWordOffset,
+              a.targetIndex + tgtWordOffset,
             ));
           }
+          
+          // Update offsets for the next sentence in the paragraph
+          srcWordOffset += sWords.length;
+          tgtWordOffset += tWords.length;
         }
-        sourceWordOffset += _extractWords(s).length;
-        targetWordOffset += _extractWords(t).length;
       }
     }
 
+    // 4. COMMIT TO PARAGRAPH INFO
     paraInfo.translatedText = translatedSentences.join(' ');
-    paraInfo.alignment = combinedAlignments;
+    paraInfo.alignment = globalAlignments;
 
     if (verbose) {
-      _log('✨ TRANS: ${paraInfo.translatedText}');
+      _log('║ PARAGRAPH TRANSLATED: ${sentences.length} sentences aligned.');
+      _log('║   Final Word Count: Src($srcWordOffset) ↔ Tgt($tgtWordOffset)');
     }
+  }
+
+  /// for clean tokenization
+  List<String> _extractWords(String text) {
+    // ✅ MUST match getWords() regex - Unicode-aware
+    return RegExp(r'[\p{L}\p{N}]+', unicode: true)
+        .allMatches(text)
+        .map((m) => m.group(0)!)
+        .toList();
+  }
+  
+  List<String> _alphabeticalTokenize(String text) {
+    // This extracts only the "semantic" words, ignoring punctuation.
+    return RegExp(r'\w+').allMatches(text).map((m) => m.group(0)!).toList();
   }
 
   // STOP SHORTENING LOGS
   void _log(String message) {
     if (verbose) print(message); // Remove any string shortening logic here
-  }
-
-  List<String> _extractWords(String text) {
-    // This matches words while ignoring punctuation
-    final regex = RegExp(r'\w+');
-    return regex.allMatches(text).map((m) => m.group(0)!).toList();
   }
 
   // ============================================================================
@@ -771,60 +943,288 @@ class DocxTranslator {
   }
 
   void _rebuildParagraph(ParagraphInfo paraInfo) {
-    if (paraInfo.translatedText == null || paraInfo.translatedText!.trim().isEmpty) return;
+    if (paraInfo.translatedText == null) return;
 
     final pElem = paraInfo.element;
     final transPara = paraInfo.transPara;
     final translatedText = paraInfo.translatedText!;
     final alignment = paraInfo.alignment ?? [];
 
-    // 1. Anchor Extraction (Cloning footnote markers)
+    // 1. EXTRACT ANCHORS & PURGE
+    final pPr = pElem.findElements('w:pPr', namespace: wNamespace).firstOrNull?.copy();
     final anchors = pElem.children.whereType<XmlElement>().where((el) {
       return el.name.local == 'r' && el.descendants.any((d) => 
         d is XmlElement && (d.name.local == 'footnoteReference' || d.name.local == 'footnoteRef'));
     }).map((el) => el.copy()).toList();
 
-    // 2. Clear Runs only
-    final runsToRemove = pElem.children.where((el) => el is XmlElement && el.name.local == 'r').toList();
-    for (var run in runsToRemove) { pElem.children.remove(run); }
+    pElem.children.clear();
+    if (pPr != null) pElem.children.add(pPr); 
 
-    // 3. Handle Footnote Para Start
-    final isFootnotePara = paraInfo.location == 'footnote';
-    if (isFootnotePara && anchors.isNotEmpty) {
-      for (var a in anchors) pElem.children.add(a);
-      pElem.children.add(_createSimpleRun('\u00A0'));
+    // 2. REPLICATE PYTHON TOKENIZATION
+    // Split by whitespace to get "Raw Units" for Word Runs
+    final tgtRawUnits = translatedText.split(' ');
+    
+    // Create a clean list of words for alignment matching
+    final tgtWordsClean = _alphabeticalTokenize(translatedText);
+    final srcWordsClean = transPara.getWords(); // Ensure this uses _alphabeticalTokenize too
+
+    if (verbose) {
+      print('║ ALIGN DEBUG | SrcWords: ${srcWordsClean.length} | TgtWords: ${tgtWordsClean.length}');
+      _traceAlignments(srcWordsClean, tgtWordsClean, alignment);
     }
 
-    // 4. Neural Mapping (Parity with Python Step 5)
-    final tgtRawUnits = translatedText.split(RegExp(r'\s+'));
     final formattedIndices = transPara.getFormattedWordIndices();
+    
+    // Map: Clean Index -> Raw Unit Index
     final cleanToRawTgt = <int, int>{};
-    int cleanIdx = 0;
+    int currentCleanIdx = 0;
     for (int i = 0; i < tgtRawUnits.length; i++) {
-      if (tgtRawUnits[i].contains(RegExp(r'\w'))) cleanToRawTgt[cleanIdx++] = i;
+      // If this unit contains a word, map it to the next clean index
+      if (RegExp(r'\w').hasMatch(tgtRawUnits[i])) {
+        if (currentCleanIdx < tgtWordsClean.length) {
+          cleanToRawTgt[currentCleanIdx] = i;
+          currentCleanIdx++;
+        }
+      }
     }
 
     final fontTemplate = transPara.runs.isNotEmpty ? transPara.runs.first : null;
 
-    // 5. Reconstruct with Master Formatter
+    // 3. RECONSTRUCTION LOOP
     for (int i = 0; i < tgtRawUnits.length; i++) {
       final text = tgtRawUnits[i] + (i < tgtRawUnits.length - 1 ? ' ' : '');
       String? styleType;
+
+      // Determine if this Raw Unit i should be formatted
+      final link = alignment.where((a) => cleanToRawTgt[a.targetIndex] == i).firstOrNull;
       
-      final matchedSrc = alignment.where((l) => cleanToRawTgt[l.targetIndex] == i).map((l) => l.sourceIndex);
-      for (var sIdx in matchedSrc) {
-        if (formattedIndices['italic_bold']!.contains(sIdx)) { styleType = 'italic_bold'; break; }
-        else if (formattedIndices['bold']!.contains(sIdx)) { styleType = 'bold'; }
-        else if (formattedIndices['italic']!.contains(sIdx) && styleType != 'bold') { styleType = 'italic'; }
+      if (link != null) {
+        final sIdx = link.sourceIndex;
+        if (formattedIndices['italic_bold']!.contains(sIdx)) styleType = 'italic_bold';
+        else if (formattedIndices['bold']!.contains(sIdx)) styleType = 'bold';
+        else if (formattedIndices['italic']!.contains(sIdx)) styleType = 'italic';
       }
 
-      pElem.children.add(_createFormattedRun(text, fontTemplate, styleType));
+      pElem.children.add(_createFormattedRun(
+        text: text,
+        fontTemplate: fontTemplate,
+        styleType: styleType,
+      ));
     }
 
-    // 6. Anchor Body Citation at end
-    if (!isFootnotePara && anchors.isNotEmpty) {
+    // 4. RE-ANCHOR FOOTNOTES
+    if (paraInfo.location != 'footnote' && anchors.isNotEmpty) {
       for (var a in anchors) pElem.children.add(a);
     }
+  }
+
+  void applyAlignedFormatting(
+    XmlElement paraElem,
+    TranslatableParagraph transPara,
+    String translatedText,
+    List<Alignment> alignment,
+  ) {
+    print('✨ [DEBUG] applyAlignedFormatting() START');
+    print('🔍 [DEBUG] Original: "${transPara.getText()}"');
+    print('🔍 [DEBUG] Translated: "$translatedText"');
+    print('🔍 [DEBUG] Alignments: ${alignment.length}');
+
+    final fontTemplate = transPara.runs.isNotEmpty ? transPara.runs[0] : null;
+    print('🔍 [DEBUG] Font template: ${fontTemplate != null ? fontTemplate.fontName : "NULL"}');
+    
+    // STEP 1: Restore paragraph-level metadata
+    final pPr = paraElem.findElements('w:pPr').firstOrNull;
+    if (pPr != null && transPara.metadata.isNotEmpty) {
+      // Restore alignment
+      if (transPara.metadata.containsKey('alignment')) {
+        var jc = pPr.findElements('w:jc').firstOrNull;
+        if (jc == null) {
+          jc = XmlElement(XmlName('w:jc'));
+          pPr.children.add(jc);
+        }
+        jc.setAttribute('w:val', transPara.metadata['alignment']);
+      }
+      
+      // Restore indentation
+      if (transPara.metadata.containsKey('indLeft')) {
+        var ind = pPr.findElements('w:ind').firstOrNull;
+        if (ind == null) {
+          ind = XmlElement(XmlName('w:ind'));
+          pPr.children.add(ind);
+        }
+        if (transPara.metadata['indLeft'] != null) {
+          ind.setAttribute('w:left', transPara.metadata['indLeft']);
+        }
+        if (transPara.metadata['indRight'] != null) {
+          ind.setAttribute('w:right', transPara.metadata['indRight']);
+        }
+        if (transPara.metadata['indFirstLine'] != null) {
+          ind.setAttribute('w:firstLine', transPara.metadata['indFirstLine']);
+        }
+      }
+      
+      // Restore spacing
+      if (transPara.metadata.containsKey('spaceBefore')) {
+        var spacing = pPr.findElements('w:spacing').firstOrNull;
+        if (spacing == null) {
+          spacing = XmlElement(XmlName('w:spacing'));
+          pPr.children.add(spacing);
+        }
+        if (transPara.metadata['spaceBefore'] != null) {
+          spacing.setAttribute('w:before', transPara.metadata['spaceBefore']);
+        }
+        if (transPara.metadata['spaceAfter'] != null) {
+          spacing.setAttribute('w:after', transPara.metadata['spaceAfter']);
+        }
+        if (transPara.metadata['lineRule'] != null) {
+          spacing.setAttribute('w:lineRule', transPara.metadata['lineRule']);
+        }
+        if (transPara.metadata['line'] != null) {
+          spacing.setAttribute('w:line', transPara.metadata['line']);
+        }
+      }
+    }
+    
+    // STEP 2: Clear existing runs
+    final existingRuns = paraElem.findElements('w:r').toList();
+    for (final run in existingRuns) {
+      paraElem.children.remove(run);
+    }
+    print('🗑️  [DEBUG] Cleared ${existingRuns.length} existing runs');
+    
+    // STEP 3: Prepare alignment mapping
+    final srcCleanWords = transPara.getWords();
+    final tgtRawUnits = translatedText.split(RegExp(r'\s+'));
+    final formattedIndices = transPara.getFormattedWordIndices();
+    
+    print('🔍 [DEBUG] Source clean words: $srcCleanWords');
+    print('🔍 [DEBUG] Target raw units: $tgtRawUnits');
+    
+    // Map clean target indices to raw unit indices
+    final cleanToRawTgt = <int, int>{};
+    int cleanIdx = 0;
+    for (int rawIdx = 0; rawIdx < tgtRawUnits.length; rawIdx++) {
+      final unit = tgtRawUnits[rawIdx];
+      // Only count as "word" if it has alphanumeric
+      if (RegExp(r'\w').hasMatch(unit)) {
+        cleanToRawTgt[cleanIdx] = rawIdx;
+        print('🔍 [DEBUG] Clean[$cleanIdx] → Raw[$rawIdx] "$unit"');
+        cleanIdx++;
+      }
+    }
+    
+    // STEP 4: Reconstruct runs with aligned formatting
+    for (int i = 0; i < tgtRawUnits.length; i++) {
+      final unit = tgtRawUnits[i];
+      final runText = i < tgtRawUnits.length - 1 ? '$unit ' : unit;
+      
+      // Determine style from alignment
+      String? styleType;
+      final matchedSrc = <int>[];
+      
+      for (final align in alignment) {
+        if (cleanToRawTgt[align.targetIndex] == i) { // Use targetIndex
+          matchedSrc.add(align.sourceIndex); // Use sourceIndex
+        }
+      }
+      
+      if (matchedSrc.isNotEmpty) {
+        for (final sIdx in matchedSrc) {
+          if (formattedIndices['italic_bold']!.contains(sIdx)) {
+            styleType = 'italic_bold';
+            break;
+          } else if (formattedIndices['bold']!.contains(sIdx)) {
+            styleType = 'bold';
+          } else if (formattedIndices['italic']!.contains(sIdx) && styleType != 'bold') {
+            styleType = 'italic';
+          }
+        }
+      }
+      
+      print('🔍 [DEBUG] Unit[$i] "$unit" → style: $styleType, matched src: $matchedSrc');
+      
+      // Create new run
+      final newRun = _createFormattedRun(
+        text: runText,
+        styleType: styleType,
+        fontTemplate: fontTemplate,
+      );
+      
+      paraElem.children.add(newRun);
+    }
+    
+    print('✨ [DEBUG] Created ${tgtRawUnits.length} new runs');
+  }
+
+  XmlElement _createFormattedRun({
+    required String text,
+    String? styleType,
+    FormatRun? fontTemplate,
+  }) {
+    final builder = XmlBuilder();
+    
+    builder.element('w:r', nest: () {
+      // Only add rPr if we have formatting to apply
+      if (styleType != null || fontTemplate != null) {
+        builder.element('w:rPr', nest: () {
+          // Apply inline styles from alignment
+          if (styleType == 'italic_bold') {
+            builder.element('w:b');
+            builder.element('w:i');
+          } else if (styleType == 'bold') {
+            builder.element('w:b');
+          } else if (styleType == 'italic') {
+            builder.element('w:i');
+          }
+          
+          // Apply baseline aesthetics from template
+          if (fontTemplate != null) {
+            // Font name (CRITICAL: Use w:rFonts with all variants)
+            if (fontTemplate.fontName != null) {
+              builder.element('w:rFonts', attributes: {
+                'w:ascii': fontTemplate.fontName!,
+                'w:hAnsi': fontTemplate.fontName!,
+                'w:eastAsia': fontTemplate.fontName!,
+                'w:cs': fontTemplate.fontName!,
+              });
+            }
+            
+            // Font size (in half-points)
+            if (fontTemplate.fontSize != null) {
+              builder.element('w:sz', attributes: {
+                'w:val': (fontTemplate.fontSize! * 2).toInt().toString(),
+              });
+            }
+            
+            // Font color
+            if (fontTemplate.fontColor != null) {
+              builder.element('w:color', attributes: {
+                'w:val': fontTemplate.fontColor!.toHex(),
+              });
+            }
+            
+            // Underline
+            if (fontTemplate.underline == true) {
+              builder.element('w:u', attributes: {
+                'w:val': 'single',
+              });
+            }
+          }
+        });
+      }
+      
+      // Add text element with space preservation
+      builder.element('w:t', 
+        nest: text,
+        attributes: {
+          if (text.startsWith(' ') || text.endsWith(' ')) 
+            'xml:space': 'preserve',
+        }
+      );
+    });
+    
+    // CRITICAL: Use copy() to detach from builder's document
+    return builder.buildDocument().rootElement.copy() as XmlElement;
   }
 
 // Helper method to create a deep copy of an XML element
@@ -946,48 +1346,6 @@ XmlElement _createSimpleRun(String text) {
   return builder.buildDocument().rootElement.copy() as XmlElement;
 }
 
-  XmlElement _createFormattedRun(String text, FormatRun? template, String? style) {
-    final builder = XmlBuilder();
-    builder.element('w:r', nest: () {
-      builder.element('w:rPr', nest: () {
-        // Apply Neural Aligned Styles
-        if (style == 'bold' || style == 'italic_bold') builder.element('w:b');
-        if (style == 'italic' || style == 'italic_bold') builder.element('w:i');
-        
-        if (template != null) {
-          // Force Theme Bypass (Parity with copy_font_properties)
-          if (template.fontName != null) {
-            builder.element('w:rFonts', attributes: {
-              'w:ascii': template.fontName!,
-              'w:hAnsi': template.fontName!,
-              'w:cs': template.fontName!,
-              'w:eastAsia': template.fontName!,
-            });
-          }
-          if (template.fontSize != null) {
-            final val = (template.fontSize! * 2).round().toString();
-            builder.element('w:sz', attributes: {'w:val': val});
-            builder.element('w:szCs', attributes: {'w:val': val});
-          }
-          if (template.fontColor != null) {
-            builder.element('w:color', attributes: {'w:val': template.fontColor!.toHex()});
-          }
-          if (template.underline == true) {
-            builder.element('w:u', attributes: {'w:val': 'single'});
-          }
-          // Re-inject preserved XML nodes
-          for (final node in template.extraProperties) {
-            builder.xml(node.toXmlString());
-          }
-        }
-      });
-
-      builder.element('w:t', nest: text, attributes: {
-        if (text.startsWith(' ') || text.endsWith(' ')) 'xml:space': 'preserve',
-      });
-    });
-    return builder.buildDocument().rootElement.copy() as XmlElement;
-  }
 
   // ============================================================================
   // ARCHIVE UTILITIES

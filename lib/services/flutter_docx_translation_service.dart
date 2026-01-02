@@ -36,58 +36,120 @@ class FlutterDocxTranslationService {
     required String sourceLang,
     required String targetLang,
     required Function(DocxTranslationProgress) onProgress,
-    required Function(String, String, List<Alignment>) onSegmentTranslated, // CHANGED
-  }) async {
-    print('🔧 [FLUTTER-DOCX] Starting Flutter-native DOCX translation...');
+    required Function(String, String, List<Alignment>) onSegmentTranslated,
+    }) async {
+    print('🔧 [FLUTTER-DOCX] ==================== TRANSLATION START ====================');
+    print('🔧 [FLUTTER-DOCX] Source: $sourceLang → Target: $targetLang');
     
     // Initialize aligner if not done yet
     if (_aligner == null || !_aligner!.isInitialized) {
-      await initialize();
+        await initialize();
     }
     
-    final wrappedService = _ONNXTranslationServiceWrapper(onnxService);
-    
-    // Use ONNX aligner if available, otherwise heuristic
     final aligner = _aligner ?? HeuristicAligner();
     print('🔧 [FLUTTER-DOCX] Using aligner: ${_aligner != null ? "ONNX BERT" : "Heuristic"}');
     
-    final translator = DocxTranslator(
-      translationService: wrappedService,
-      aligner: aligner,
-      verbose: verbose,
-    );
+    // Decode DOCX
+    final archive = ZipDecoder().decodeBytes(inputBytes);
+    final docXml = _getFileFromArchive(archive, 'word/document.xml');
+    final docString = utf8.decode(docXml.content as List<int>);
+    final document = XmlDocument.parse(docString);
     
-    int totalSegments = await _countSegments(inputBytes);
+    final paragraphs = document.findAllElements('w:p').toList();
+    print('📄 [FLUTTER-DOCX] Found ${paragraphs.length} paragraphs');
+    
+    int totalSegments = paragraphs.where((p) => p.innerText.trim().isNotEmpty).length;
     int completedSegments = 0;
     
-    wrappedService.onTranslate = (source, target) {
-      completedSegments++;
-      
-      onProgress(DocxTranslationProgress(
-        totalSegments: totalSegments,
-        completedSegments: completedSegments,
-        currentSegment: source.length > 50 
-          ? '${source.substring(0, 50)}...' 
-          : source,
-      ));
-      
-      // Get alignments from the aligner
-      final sourceWords = source.split(RegExp(r'\s+'));
-      final targetWords = target.split(RegExp(r'\s+'));
-      final alignments = aligner.align(sourceWords, targetWords);
-      
-      onSegmentTranslated(source, target, alignments);
-    };
-    
-    final outputBytes = await translator.translateDocument(
-      docxBytes: inputBytes,
-      targetLanguage: targetLang,
-      sourceLanguage: sourceLang,
+    // Create translator instance with extractParagraph method
+    final translator = DocxTranslator(
+        translationService: _ONNXTranslationServiceWrapper(onnxService),
+        aligner: aligner,
+        verbose: verbose,
     );
     
-    print('✅ [FLUTTER-DOCX] Translation complete!');
-    return outputBytes;
-  }
+    // Process each paragraph
+    for (final paraElem in paragraphs) {
+        final originalText = paraElem.innerText.trim();
+        if (originalText.isEmpty) continue;
+        
+        print('\n📝 [PARA] Processing: "${originalText.substring(0, originalText.length > 50 ? 50 : originalText.length)}..."');
+        
+        try {
+        // STEP 1: Extract with formatting
+        final transPara = translator.extractParagraph(paraElem);
+        
+        // STEP 2: Translate
+        final translatedText = await onnxService.translate(
+            originalText,
+            targetLang,
+            sourceLanguage: sourceLang,
+        );
+        
+        print('📝 [PARA] Translated: "${translatedText.substring(0, translatedText.length > 50 ? 50 : translatedText.length)}..."');
+        
+        // STEP 3: Get alignments (CLEAN WORDS ONLY)
+        final srcCleanWords = transPara.getWords();
+
+        // ✅ FIX: Unicode-aware word extraction for German
+        final tgtCleanWords = RegExp(r'[\p{L}\p{N}]+', unicode: true)
+            .allMatches(translatedText)
+            .map((m) => m.group(0)!)
+            .toList();
+
+        print('🔗 [PARA] Aligning: ${srcCleanWords.length} → ${tgtCleanWords.length}');
+        final alignments = aligner.align(srcCleanWords, tgtCleanWords);
+        
+        print('🔗 [PARA] Got ${alignments.length} alignments');
+        
+        // STEP 4: Reconstruct with aligned formatting
+        translator.applyAlignedFormatting(
+            paraElem,
+            transPara,
+            translatedText,
+            alignments,
+        );
+        
+        // Progress callback
+        completedSegments++;
+        onProgress(DocxTranslationProgress(
+            totalSegments: totalSegments,
+            completedSegments: completedSegments,
+            currentSegment: originalText.length > 50 
+            ? '${originalText.substring(0, 50)}...' 
+            : originalText,
+        ));
+        
+        onSegmentTranslated(originalText, translatedText, alignments);
+        
+        } catch (e, stack) {
+        print('❌ [PARA] Failed: $e');
+        if (verbose) print(stack);
+        }
+    }
+    
+    // Re-encode DOCX
+    final modifiedXml = document.toXmlString(pretty: false);
+    
+    // Replace document.xml in archive
+    final newArchive = Archive();
+    for (final file in archive.files) {
+        if (file.name == 'word/document.xml') {
+        newArchive.addFile(ArchiveFile(
+            file.name,
+            modifiedXml.length,
+            utf8.encode(modifiedXml),
+        ));
+        } else {
+        newArchive.addFile(file);
+        }
+    }
+    
+    final outputBytes = ZipEncoder().encode(newArchive)!;
+    print('✅ [FLUTTER-DOCX] ==================== TRANSLATION COMPLETE ====================');
+    
+    return Uint8List.fromList(outputBytes);
+    }
   
   Future<int> _countSegments(Uint8List docxBytes) async {
     try {

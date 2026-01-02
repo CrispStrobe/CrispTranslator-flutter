@@ -493,15 +493,11 @@ class _TranslatorPageState extends State<TranslatorPage> with SingleTickerProvid
   }
 
   Future<void> _downloadTranslatedDocx() async {
-    // Ensure we have data and a filename before proceeding
     if (_translatedDocxBytes == null || _docxFileName == null) return;
 
     try {
-      // 1. Prepare the suggested filename
       final fileName = _docxFileName!.replaceAll('.docx', '_${_targetLanguage.toLowerCase()}.docx');
       
-      // 2. Open the Save Dialog to get the destination path.
-      // We do NOT pass the bytes here; we handle the writing ourselves for better reliability on macOS.
       final outputPath = await FilePicker.platform.saveFile(
         dialogTitle: 'Save translated document',
         fileName: fileName,
@@ -509,21 +505,25 @@ class _TranslatorPageState extends State<TranslatorPage> with SingleTickerProvid
         allowedExtensions: ['docx'],
       );
 
-      // 3. If the user didn't cancel (outputPath is not null), write the bytes
       if (outputPath != null) {
         final file = File(outputPath);
-        
-        // Writing manually ensures the file is created correctly within the sandbox-granted path
         await file.writeAsBytes(_translatedDocxBytes!);
+        print('✅ [SAVE] File written to: $outputPath');
 
         if (mounted) {
           ScaffoldMessenger.of(context).showSnackBar(
             SnackBar(
-              content: Text('Saved successfully!'),
+              content: Text('Saved to: ${file.path.split('/').last}'),
+              duration: const Duration(seconds: 5),
               action: SnackBarAction(
                 label: 'Open',
-                onPressed: () {
-                  // Optional: You could add logic here to open the folder
+                onPressed: () async {
+                  // For macOS: Opens the folder and selects the file
+                  if (Platform.isMacOS) {
+                    await Process.run('open', ['-R', outputPath]);
+                  } else if (Platform.isWindows) {
+                    await Process.run('explorer.exe', ['/select,', outputPath]);
+                  }
                 },
               ),
             ),
@@ -532,9 +532,7 @@ class _TranslatorPageState extends State<TranslatorPage> with SingleTickerProvid
       }
     } catch (e) {
       print('❌ [SAVE] Error: $e');
-      if (mounted) {
-        setState(() => _error = 'Failed to save file: $e');
-      }
+      setState(() => _error = 'Failed to save file: $e');
     }
   }
 

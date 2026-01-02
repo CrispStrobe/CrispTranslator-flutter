@@ -66,82 +66,111 @@ class ONNXBertAligner implements WordAligner {
     if (sourceWords.isEmpty || targetWords.isEmpty) return [];
 
     try {
-      if (verbose) {
-        print('🔗 [ALIGNER] Aligning: ${sourceWords.length} → ${targetWords.length} words');
-      }
+      print('🔗 [ALIGNER] ==================== ALIGNMENT START ====================');
+      print('🔗 [ALIGNER] Source words (${sourceWords.length}): $sourceWords');
+      print('🔗 [ALIGNER] Target words (${targetWords.length}): $targetWords');
 
-      // Tokenize source words
-      final srcEncoding = _tokenizer!.encode(sourceWords);
-      final srcWordMap = srcEncoding.wordMap;
+      // 1. TOKENIZE WITH WORDMAP (Python equivalent: get_tokens_and_map)
+      final srcEncoding = _tokenizeWords(sourceWords);
+      final tgtEncoding = _tokenizeWords(targetWords);
+      
+      print('🔗 [ALIGNER] Source: ${srcEncoding.subtokens.length} subtokens → ${srcEncoding.wordMap.length} mapped');
+      print('🔗 [ALIGNER] Target: ${tgtEncoding.subtokens.length} subtokens → ${tgtEncoding.wordMap.length} mapped');
 
-      // Tokenize target words
-      final tgtEncoding = _tokenizer!.encode(targetWords);
-      final tgtWordMap = tgtEncoding.wordMap;
-
-      // Get embeddings from BERT
+      // 2. GET EMBEDDINGS
       final srcEmbeddings = _getEmbeddings(srcEncoding.inputIds, srcEncoding.attentionMask);
       final tgtEmbeddings = _getEmbeddings(tgtEncoding.inputIds, tgtEncoding.attentionMask);
 
       if (srcEmbeddings == null || tgtEmbeddings == null) {
-        print('⚠️  [ALIGNER] Failed to get embeddings, falling back');
+        print('⚠️  [ALIGNER] Failed to get embeddings');
         return HeuristicAligner().align(sourceWords, targetWords);
       }
 
-      // Compute similarity matrix
-      final similarity = _computeSimilarity(srcEmbeddings, tgtEmbeddings);
+      print('🔗 [ALIGNER] Embeddings: src=${srcEmbeddings.length}, tgt=${tgtEmbeddings.length}');
 
-      // Extract alignments using competitive selection
-      final alignments = <Alignment>[];
-      final seen = <String>{};
+      // Verify dimensions match
+      if (srcEmbeddings.length != srcEncoding.wordMap.length ||
+          tgtEmbeddings.length != tgtEncoding.wordMap.length) {
+        print('❌ [ALIGNER] Dimension mismatch! Src: ${srcEmbeddings.length} vs ${srcEncoding.wordMap.length}, Tgt: ${tgtEmbeddings.length} vs ${tgtEncoding.wordMap.length}');
+        return HeuristicAligner().align(sourceWords, targetWords);
+      }
 
-      // Forward pass: best target for each source
-      final bestTgtForSrc = <int>[];
-      for (int i = 0; i < similarity.length; i++) {
+      // 3. NORMALIZE EMBEDDINGS (Python: src_out / np.linalg.norm)
+      final srcNorm = _normalizeEmbeddings(srcEmbeddings);
+      final tgtNorm = _normalizeEmbeddings(tgtEmbeddings);
+
+      // 4. COMPUTE SIMILARITY MATRIX (Python: np.dot(src_norm, tgt_norm.T))
+      final similarity = _computeSimilarity(srcNorm, tgtNorm);
+      final srcLen = similarity.length;
+      final tgtLen = similarity[0].length;
+      
+      print('🔗 [ALIGNER] Similarity matrix: ${srcLen}x$tgtLen');
+
+      // 5. FORWARD PASS: For each source token, find best target token
+      final forwardMatches = List<int>.filled(srcLen, -1);
+      
+      for (int i = 0; i < srcLen; i++) {
         int bestJ = 0;
         double maxSim = similarity[i][0];
-        for (int j = 1; j < similarity[i].length; j++) {
+        
+        for (int j = 1; j < tgtLen; j++) {
           if (similarity[i][j] > maxSim) {
             maxSim = similarity[i][j];
             bestJ = j;
           }
         }
-        bestTgtForSrc.add(bestJ);
+        
+        forwardMatches[i] = bestJ;
       }
 
-      // Backward pass: best source for each target
-      final bestSrcForTgt = <int>[];
-      for (int j = 0; j < similarity[0].length; j++) {
+      // 6. BACKWARD PASS: For each target token, find best source token
+      final backwardMatches = List<int>.filled(tgtLen, -1);
+      
+      for (int j = 0; j < tgtLen; j++) {
         int bestI = 0;
         double maxSim = similarity[0][j];
-        for (int i = 1; i < similarity.length; i++) {
+        
+        for (int i = 1; i < srcLen; i++) {
           if (similarity[i][j] > maxSim) {
             maxSim = similarity[i][j];
             bestI = i;
           }
         }
-        bestSrcForTgt.add(bestI);
+        
+        backwardMatches[j] = bestI;
       }
 
-      // Symmetric selection
-      for (int i = 0; i < bestTgtForSrc.length; i++) {
-        final j = bestTgtForSrc[i];
-        if (bestSrcForTgt[j] == i) {
-          // Map sub-token indices back to word indices
-          final srcWordIdx = srcWordMap[i];
-          final tgtWordIdx = tgtWordMap[j];
+      // 7. MUTUAL ARGMAX INTERSECTION (Python: if best_src_for_tgt[j] == i)
+      final alignments = <Alignment>[];
+      final seen = <String>{};
+      const threshold = 0.001; // Python: 1e-3
+
+      for (int i = 0; i < srcLen; i++) {
+        final j = forwardMatches[i];
+        
+        // MUTUAL AGREEMENT: src i picked tgt j AND tgt j picked src i
+        if (backwardMatches[j] == i && similarity[i][j] > threshold) {
+          // Map subword indices to word indices
+          final srcWordIdx = srcEncoding.wordMap[i];
+          final tgtWordIdx = tgtEncoding.wordMap[j];
 
           final key = '$srcWordIdx-$tgtWordIdx';
           if (!seen.contains(key)) {
             alignments.add(Alignment(srcWordIdx, tgtWordIdx));
             seen.add(key);
+            
+            if (verbose) {
+              print('🔗 [ALIGNER] ✓ Align: src[$srcWordIdx]"${sourceWords[srcWordIdx]}" ↔ tgt[$tgtWordIdx]"${targetWords[tgtWordIdx]}" (sim=${similarity[i][j].toStringAsFixed(3)})');
+            }
           }
         }
       }
-
-      if (verbose) {
-        print('✅ [ALIGNER] Found ${alignments.length} alignment links');
+      
+      print('🔗 [ALIGNER] ==================== FOUND ${alignments.length} ALIGNMENTS ====================');
+      for (final a in alignments) {
+        print('   ${a.sourceIndex} ↔ ${a.targetIndex}');
       }
-
+      
       return alignments;
     } catch (e, stack) {
       print('❌ [ALIGNER] Alignment failed: $e');
@@ -150,92 +179,146 @@ class ONNXBertAligner implements WordAligner {
     }
   }
 
+  // CRITICAL: Tokenize per-word with wordMap (matches Python's get_tokens_and_map)
+  _TokenizationResult _tokenizeWords(List<String> words) {
+    final subtokens = <String>[];
+    final wordMap = <int>[];
+    
+    print('🔍 [TOKENIZER] Tokenizing ${words.length} words...');
+    
+    // Process each word individually
+    for (int wordIdx = 0; wordIdx < words.length; wordIdx++) {
+        final word = words[wordIdx];
+        
+        // Tokenize this word
+        final tokens = _tokenizer!.tokenizeWord(word);
+        
+        if (tokens.isEmpty) {
+        // If tokenization failed, use [UNK]
+        subtokens.add('[UNK]');
+        wordMap.add(wordIdx);
+        } else {
+        // Add all subtokens for this word
+        subtokens.addAll(tokens);
+        // Map each subtoken back to the original word index
+        wordMap.addAll(List.filled(tokens.length, wordIdx));
+        }
+    }
+    
+    print('🔍 [TOKENIZER] Result: ${subtokens.length} subtokens for ${words.length} words');
+    print('🔍 [TOKENIZER] First 10 subtokens: ${subtokens.take(10).toList()}');
+    
+    // Build input IDs with [CLS] and [SEP]
+    final inputIds = <int>[101]; // [CLS]
+    final attentionMask = <int>[1];
+    
+    for (final token in subtokens) {
+        final id = _tokenizer!._vocab[token] ?? 100; // [UNK] if not found
+        inputIds.add(id);
+        attentionMask.add(1);
+    }
+    
+    inputIds.add(102); // [SEP]
+    attentionMask.add(1);
+    
+    print('🔍 [TOKENIZER] Final sequence: ${inputIds.length} tokens (including CLS/SEP)');
+    
+    return _TokenizationResult(
+        subtokens: subtokens,
+        inputIds: Int64List.fromList(inputIds),
+        attentionMask: Int64List.fromList(attentionMask),
+        wordMap: wordMap,
+    );
+    }
+
+  // Normalize embeddings (Python: emb / np.linalg.norm(emb, axis=-1, keepdims=True))
+  List<List<double>> _normalizeEmbeddings(List<List<double>> embeddings) {
+    return embeddings.map((emb) {
+      double sumSq = 0.0;
+      for (final val in emb) {
+        sumSq += val * val;
+      }
+      final norm = math.sqrt(sumSq);
+      
+      if (norm < 1e-9) {
+        return List<double>.filled(emb.length, 0.0);
+      }
+      
+      return emb.map((v) => v / norm).toList();
+    }).toList();
+  }
+
   List<List<double>>? _getEmbeddings(Int64List inputIds, Int64List attentionMask) {
+    OrtValueTensor? idTensor;
+    OrtValueTensor? maskTensor;
+    OrtRunOptions? runOptions;
+    List<OrtValue?>? outputs;
+
     try {
-      final idTensor = OrtValueTensor.createTensorWithDataList(
-        inputIds,
-        [1, inputIds.length],
-      );
+      idTensor = OrtValueTensor.createTensorWithDataList(inputIds, [1, inputIds.length]);
+      maskTensor = OrtValueTensor.createTensorWithDataList(attentionMask, [1, attentionMask.length]);
+      runOptions = OrtRunOptions();
+      
+      // Run ONNX model
+      outputs = _session!.run(runOptions, {
+        'input_ids': idTensor,
+        'attention_mask': maskTensor
+      });
 
-      final maskTensor = OrtValueTensor.createTensorWithDataList(
-        attentionMask,
-        [1, attentionMask.length],
-      );
+      if (outputs == null || outputs.isEmpty || outputs[0] == null) {
+        print('❌ [ALIGNER] No output from ONNX model');
+        return null;
+      }
 
-      final outputs = _session!.run(
-        OrtRunOptions(),
-        {
-          'input_ids': idTensor,
-          'attention_mask': maskTensor,
-        },
-      );
-
-      idTensor.release();
-      maskTensor.release();
-
-      if (outputs == null || outputs.isEmpty) return null;
-
-      // Extract embeddings (remove CLS and SEP tokens)
-      final List rawOutput = outputs[0]!.value as List;
-      final List sequence = rawOutput[0] as List;
-
-      // Skip [CLS] at position 0 and [SEP] at end
+      // Extract last_hidden_state [1, seq_len, 768]
+      final List rawValue = outputs[0]!.value as List;
+      final List sequence = rawValue[0] as List;
+      
       final embeddings = <List<double>>[];
+      
+      // Python: [0, 1:-1] - skip CLS (index 0) and SEP (last index)
       for (int i = 1; i < sequence.length - 1; i++) {
         final List embedding = sequence[i] as List;
         embeddings.add(embedding.map((e) => (e as num).toDouble()).toList());
       }
 
-      outputs[0]!.release();
-
+      print('🔗 [ALIGNER] Extracted ${embeddings.length} embeddings (excluding CLS/SEP)');
       return embeddings;
+      
     } catch (e) {
-      print('❌ [ALIGNER] Failed to get embeddings: $e');
+      print('❌ [ALIGNER] Inference Error: $e');
       return null;
+    } finally {
+      // Release memory
+      idTensor?.release();
+      maskTensor?.release();
+      runOptions?.release();
+      if (outputs != null) {
+        for (var element in outputs) {
+          element?.release();
+        }
+      }
     }
   }
 
-  List<List<double>> _computeSimilarity(
-    List<List<double>> srcEmb,
-    List<List<double>> tgtEmb,
-  ) {
-    // Normalize embeddings for cosine similarity
-    final srcNorm = _normalize(srcEmb);
-    final tgtNorm = _normalize(tgtEmb);
-
-    // Compute dot product (cosine similarity after normalization)
-    final similarity = <List<double>>[];
+  // Compute cosine similarity matrix (Python: np.dot(src_norm, tgt_norm.T))
+  List<List<double>> _computeSimilarity(List<List<double>> srcNorm, List<List<double>> tgtNorm) {
+    final similarity = List.generate(
+      srcNorm.length,
+      (_) => List<double>.filled(tgtNorm.length, 0.0)
+    );
+    
     for (int i = 0; i < srcNorm.length; i++) {
-      final row = <double>[];
       for (int j = 0; j < tgtNorm.length; j++) {
-        double dotProduct = 0;
+        double dotProduct = 0.0;
         for (int k = 0; k < srcNorm[i].length; k++) {
           dotProduct += srcNorm[i][k] * tgtNorm[j][k];
         }
-        row.add(dotProduct);
+        similarity[i][j] = dotProduct;
       }
-      similarity.add(row);
     }
-
+    
     return similarity;
-  }
-
-  List<List<double>> _normalize(List<List<double>> embeddings) {
-    final normalized = <List<double>>[];
-    for (final emb in embeddings) {
-      double norm = 0;
-      for (final val in emb) {
-        norm += val * val;
-      }
-      norm = math.sqrt(norm);
-
-      if (norm < 1e-9) {
-        normalized.add(List.filled(emb.length, 0.0));
-      } else {
-        normalized.add(emb.map((v) => v / norm).toList());
-      }
-    }
-    return normalized;
   }
 
   void dispose() {
@@ -246,68 +329,86 @@ class ONNXBertAligner implements WordAligner {
   bool get isInitialized => _isInitialized;
 }
 
-// Simple BERT tokenizer for word-level tokenization
-class BertTokenizer {
-  static const int clsTokenId = 101;
-  static const int sepTokenId = 102;
-  static const int unkTokenId = 100;
-  static const int padTokenId = 0;
-
-  Future<void> initialize() async {
-    // Already initialized - using character-level tokenization
-  }
-
-  TokenizerOutput encode(List<String> words) {
-    final inputIds = <int>[clsTokenId];
-    final attentionMask = <int>[1];
-    final wordMap = <int>[];
-
-    for (int wordIdx = 0; wordIdx < words.length; wordIdx++) {
-      final word = words[wordIdx];
-      final tokens = _tokenizeWord(word);
-
-      for (final token in tokens) {
-        inputIds.add(token);
-        attentionMask.add(1);
-        wordMap.add(wordIdx);
-      }
-    }
-
-    inputIds.add(sepTokenId);
-    attentionMask.add(1);
-
-    return TokenizerOutput(
-      inputIds: Int64List.fromList(inputIds),
-      attentionMask: Int64List.fromList(attentionMask),
-      wordMap: wordMap,
-    );
-  }
-
-  List<int> _tokenizeWord(String word) {
-    // Simple character-level encoding with hash-based IDs
-    final tokens = <int>[];
-    final chars = word.toLowerCase().split('');
-    
-    for (var char in chars) {
-      // Use character code modulo to create consistent IDs in valid range
-      // BERT vocab typically ranges from 0-30000, so we use 1000-29000
-      final charCode = char.codeUnitAt(0);
-      final tokenId = 1000 + (charCode % 28000);
-      tokens.add(tokenId);
-    }
-    
-    return tokens.isEmpty ? [unkTokenId] : tokens;
-  }
-}
-
-class TokenizerOutput {
+// Helper class for tokenization result
+class _TokenizationResult {
+  final List<String> subtokens;
   final Int64List inputIds;
   final Int64List attentionMask;
-  final List<int> wordMap; // Maps sub-token position to word index
-
-  TokenizerOutput({
+  final List<int> wordMap;
+  
+  _TokenizationResult({
+    required this.subtokens,
     required this.inputIds,
     required this.attentionMask,
     required this.wordMap,
   });
+}
+
+// Simple BERT tokenizer
+class BertTokenizer {
+  Map<String, int> _vocab = {};
+  bool _isLoaded = false;
+
+  Future<void> initialize() async {
+    if (_isLoaded) return;
+    try {
+      final data = await rootBundle.loadString('assets/onnx_models/vocab.txt');
+      final lines = data.split('\n');
+      for (int i = 0; i < lines.length; i++) {
+        final token = lines[i].trim();
+        if (token.isNotEmpty) {
+          _vocab[token] = i;
+        }
+      }
+      _isLoaded = true;
+      print('✅ [TOKENIZER] Loaded ${_vocab.length} vocab entries');
+      
+      // DEBUG: Check if common tokens exist
+      print('🔍 [TOKENIZER] Vocab check: [CLS]=${_vocab['[CLS]']}, ##ical=${_vocab['##ical']}, theology=${_vocab['theology']}');
+    } catch (e) {
+      print('❌ [TOKENIZER] Failed to load vocab.txt: $e');
+    }
+  }
+
+  // CRITICAL FIX: Proper WordPiece tokenization
+  List<String> tokenizeWord(String word) {
+    final tokens = <String>[];
+    String remaining = word; // DON'T lowercase - BERT is case-sensitive!
+    bool isFirstToken = true;
+    
+    while (remaining.isNotEmpty) {
+      String? foundToken;
+      int foundLen = 0;
+      
+      // Try to find the longest matching subtoken (greedy)
+      for (int len = remaining.length; len > 0; len--) {
+        final substr = remaining.substring(0, len);
+        // Add ## prefix for continuation tokens
+        final candidate = isFirstToken ? substr : '##$substr';
+        
+        if (_vocab.containsKey(candidate)) {
+          foundToken = candidate;
+          foundLen = len;
+          break;
+        }
+      }
+      
+      if (foundToken == null) {
+        // Can't tokenize this character - use [UNK] for the whole remaining word
+        print('⚠️  [TOKENIZER] Unknown token: "$remaining" in word "$word"');
+        return tokens.isEmpty ? ['[UNK]'] : [...tokens, '[UNK]'];
+      }
+      
+      tokens.add(foundToken);
+      remaining = remaining.substring(foundLen);
+      isFirstToken = false;
+    }
+    
+    // DEBUG: Show multi-token words
+    if (tokens.length > 1) {
+      print('🔍 [TOKENIZER] "$word" → $tokens');
+    }
+    
+    return tokens;
+  }
 }
