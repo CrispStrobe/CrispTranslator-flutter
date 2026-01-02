@@ -292,12 +292,12 @@ class TranslatableParagraph {
     Map<String, dynamic>? metadata,
   }) : metadata = metadata ?? {};
   
-  // CRITICAL: Get full text
+  // Get full text
   String getText() {
     return runs.map((r) => r.text).join('');
   }
   
-  // CRITICAL: Get CLEAN words (alphanumeric only, matching Python's re.findall(r"\w+"))
+  // Get CLEAN words (alphanumeric only, matching Python's re.findall(r"\w+"))
   List<String> getWords() {
     final text = getText();
     // ✅ Unicode-aware regex: matches letters (including umlauts) + digits
@@ -305,7 +305,7 @@ class TranslatableParagraph {
     return regex.allMatches(text).map((m) => m.group(0)!).toList();
   }
   
-  // CRITICAL: Map clean word indices to formatting
+  // Map clean word indices to formatting
   Map<String, Set<int>> getFormattedWordIndices() {
     print('🔍 [DEBUG] getFormattedWordIndices() START');
     
@@ -631,136 +631,226 @@ class DocxTranslator {
   }
   
   TranslatableParagraph _extractParagraph(XmlElement paraElem) {
-    print('📖 [DEBUG] extractParagraph() START');
+  print('📖 [DEBUG] extractParagraph() START');
+  
+  final runs = <FormatRun>[];
+  
+  // ✅ STEP 1: Resolve base font from paragraph style FIRST (like Python)
+  String resolvedBaseFont = _getResolvedFontName(paraElem);
+  print('🔍 [DEBUG] Resolved base font from style hierarchy: $resolvedBaseFont');
+  
+  // Extract all runs
+  final runElements = paraElem.findAllElements('w:r').toList();
+  print('🔍 [DEBUG] Found ${runElements.length} runs');
+  
+  for (int i = 0; i < runElements.length; i++) {
+    final runElem = runElements[i];
+    final textElem = runElem.findElements('w:t').firstOrNull;
     
-    final runs = <FormatRun>[];
-    String? resolvedBaseFont;
+    if (textElem == null) continue;
     
-    // Extract all runs
-    final runElements = paraElem.findAllElements('w:r').toList();
-    print('🔍 [DEBUG] Found ${runElements.length} runs');
+    final text = textElem.innerText;
+    if (text.isEmpty) continue;
     
-    for (int i = 0; i < runElements.length; i++) {
-      final runElem = runElements[i];
-      final textElem = runElem.findElements('w:t').firstOrNull;
+    // Extract formatting from rPr
+    final rPr = runElem.findElements('w:rPr').firstOrNull;
+    
+    bool? bold;
+    bool? italic;
+    bool? underline;
+    String? fontName;
+    double? fontSize;
+    RGBColor? fontColor; 
+    
+    if (rPr != null) {
+      // Bold
+      final boldElem = rPr.findElements('w:b').firstOrNull;
+      if (boldElem != null) {
+        final val = boldElem.getAttribute('w:val');
+        bold = (val == null || val == '1' || val == 'true');
+      }
       
-      if (textElem == null) continue;
+      // Italic
+      final italicElem = rPr.findElements('w:i').firstOrNull;
+      if (italicElem != null) {
+        final val = italicElem.getAttribute('w:val');
+        italic = (val == null || val == '1' || val == 'true');
+      }
       
-      final text = textElem.innerText;
-      if (text.isEmpty) continue;
+      // Underline
+      final uElem = rPr.findElements('w:u').firstOrNull;
+      if (uElem != null) {
+        underline = true;
+      }
       
-      // Extract formatting from rPr
-      final rPr = runElem.findElements('w:rPr').firstOrNull;
+      // Font name from rFonts
+      final rFonts = rPr.findElements('w:rFonts').firstOrNull;
+      if (rFonts != null) {
+        fontName = rFonts.getAttribute('w:ascii') ?? 
+                   rFonts.getAttribute('w:hAnsi');
+      }
       
-      bool? bold;
-      bool? italic;
-      bool? underline;
-      String? fontName;
-      double? fontSize;
-      RGBColor? fontColor; 
-      
-      if (rPr != null) {
-        // Bold
-        final boldElem = rPr.findElements('w:b').firstOrNull;
-        if (boldElem != null) {
-          final val = boldElem.getAttribute('w:val');
-          bold = (val == null || val == '1' || val == 'true');
+      // Font size from sz (half-points, so divide by 2)
+      final szElem = rPr.findElements('w:sz').firstOrNull;
+      if (szElem != null) {
+        final szVal = szElem.getAttribute('w:val');
+        if (szVal != null) {
+          fontSize = double.tryParse(szVal)! / 2.0;
         }
-        
-        // Italic
-        final italicElem = rPr.findElements('w:i').firstOrNull;
-        if (italicElem != null) {
-          final val = italicElem.getAttribute('w:val');
-          italic = (val == null || val == '1' || val == 'true');
-        }
-        
-        // Underline
-        final uElem = rPr.findElements('w:u').firstOrNull;
-        if (uElem != null) {
-          underline = true;
-        }
-        
-        // Font name from rFonts
-        final rFonts = rPr.findElements('w:rFonts').firstOrNull;
-        if (rFonts != null) {
-          fontName = rFonts.getAttribute('w:ascii') ?? 
-                     rFonts.getAttribute('w:hAnsi');
-        }
-        
-        // Font size from sz (half-points, so divide by 2)
-        final szElem = rPr.findElements('w:sz').firstOrNull;
-        if (szElem != null) {
-          final szVal = szElem.getAttribute('w:val');
-          if (szVal != null) {
-            fontSize = double.tryParse(szVal)! / 2.0;
+      }
+      
+      // Font color - CONVERT to RGBColor
+      final colorElem = rPr.findElements('w:color').firstOrNull;
+      if (colorElem != null) {
+        final colorHex = colorElem.getAttribute('w:val');
+        if (colorHex != null && colorHex != 'auto') {
+          try {
+            fontColor = RGBColor.fromHex(colorHex);
+          } catch (e) {
+            print('⚠️  [DEBUG] Invalid color value: $colorHex');
           }
         }
-        
-        // Font color - CONVERT to RGBColor
-        final colorElem = rPr.findElements('w:color').firstOrNull;
-        if (colorElem != null) {
-          final colorHex = colorElem.getAttribute('w:val');
-          if (colorHex != null && colorHex != 'auto') {
-            try {
-              fontColor = RGBColor.fromHex(colorHex);  // ✅ CONVERT
-            } catch (e) {
-              print('⚠️  [DEBUG] Invalid color value: $colorHex');
-            }
-          }
-        }
-      }
-      
-      // Resolve base font (first run with font wins)
-      if (resolvedBaseFont == null && fontName != null) {
-        resolvedBaseFont = fontName;
-      }
-      
-      final formatRun = FormatRun(
-        text: text,
-        bold: bold,
-        italic: italic,
-        underline: underline,
-        fontName: fontName ?? resolvedBaseFont ?? 'Calibri',
-        fontSize: fontSize ?? 11.0,
-        fontColor: fontColor,
-      );
-      
-      runs.add(formatRun);
-      
-      print('🔍 [DEBUG] Run[$i]: "${text.substring(0, text.length > 20 ? 20 : text.length)}" | B:$bold I:$italic F:${formatRun.fontName}');
-    }
-    
-    final transPara = TranslatableParagraph(runs: runs);
-    
-    // Store paragraph-level metadata
-    final pPr = paraElem.findElements('w:pPr').firstOrNull;
-    if (pPr != null) {
-      final jc = pPr.findElements('w:jc').firstOrNull;
-      if (jc != null) {
-        transPara.metadata['alignment'] = jc.getAttribute('w:val');
-      }
-      
-      // Indentation
-      final ind = pPr.findElements('w:ind').firstOrNull;
-      if (ind != null) {
-        transPara.metadata['indLeft'] = ind.getAttribute('w:left');
-        transPara.metadata['indRight'] = ind.getAttribute('w:right');
-        transPara.metadata['indFirstLine'] = ind.getAttribute('w:firstLine');
-      }
-      
-      // Spacing
-      final spacing = pPr.findElements('w:spacing').firstOrNull;
-      if (spacing != null) {
-        transPara.metadata['spaceBefore'] = spacing.getAttribute('w:before');
-        transPara.metadata['spaceAfter'] = spacing.getAttribute('w:after');
-        transPara.metadata['lineRule'] = spacing.getAttribute('w:lineRule');
-        transPara.metadata['line'] = spacing.getAttribute('w:line');
       }
     }
     
-    print('📖 [DEBUG] Extracted ${runs.length} runs, text length: ${transPara.getText().length}');
-    return transPara;
+    // ✅ Use resolved base font as fallback (like Python)
+    final finalFontName = fontName ?? resolvedBaseFont;
+    final finalFontSize = fontSize ?? 11.0;
+    
+    final formatRun = FormatRun(
+      text: text,
+      bold: bold,
+      italic: italic,
+      underline: underline,
+      fontName: finalFontName,
+      fontSize: finalFontSize,
+      fontColor: fontColor,
+    );
+    
+    runs.add(formatRun);
+    
+    print('🔍 [DEBUG] Run[$i]: "${text.substring(0, text.length > 20 ? 20 : text.length)}" | B:$bold I:$italic F:$finalFontName@${finalFontSize}pt');
   }
+  
+  final transPara = TranslatableParagraph(runs: runs);
+  
+  // ✅ STEP 2: Store paragraph-level metadata (INCLUDING STYLE!)
+  final pPr = paraElem.findElements('w:pPr').firstOrNull;
+  if (pPr != null) {
+    // ✅ CRITICAL: Extract and store style name
+    final pStyle = pPr.findElements('w:pStyle').firstOrNull;
+    if (pStyle != null) {
+      final styleName = pStyle.getAttribute('w:val');
+      if (styleName != null) {
+        transPara.metadata['style'] = styleName;
+        print('🔍 [DEBUG] Extracted style: $styleName');
+      }
+    }
+    
+    // Alignment
+    final jc = pPr.findElements('w:jc').firstOrNull;
+    if (jc != null) {
+      transPara.metadata['alignment'] = jc.getAttribute('w:val');
+    }
+    
+    // Indentation
+    final ind = pPr.findElements('w:ind').firstOrNull;
+    if (ind != null) {
+      transPara.metadata['indLeft'] = ind.getAttribute('w:left');
+      transPara.metadata['indRight'] = ind.getAttribute('w:right');
+      transPara.metadata['indFirstLine'] = ind.getAttribute('w:firstLine');
+      transPara.metadata['indHanging'] = ind.getAttribute('w:hanging');
+    }
+    
+    // Spacing
+    final spacing = pPr.findElements('w:spacing').firstOrNull;
+    if (spacing != null) {
+      transPara.metadata['spaceBefore'] = spacing.getAttribute('w:before');
+      transPara.metadata['spaceAfter'] = spacing.getAttribute('w:after');
+      transPara.metadata['lineRule'] = spacing.getAttribute('w:lineRule');
+      transPara.metadata['line'] = spacing.getAttribute('w:line');
+    }
+    
+    // Numbering (for lists)
+    final numPr = pPr.findElements('w:numPr').firstOrNull;
+    if (numPr != null) {
+      final ilvl = numPr.findElements('w:ilvl').firstOrNull;
+      final numId = numPr.findElements('w:numId').firstOrNull;
+      if (ilvl != null) transPara.metadata['numLevel'] = ilvl.getAttribute('w:val');
+      if (numId != null) transPara.metadata['numId'] = numId.getAttribute('w:val');
+    }
+  }
+  
+  print('📖 [DEBUG] Extracted ${runs.length} runs, text length: ${transPara.getText().length}');
+  print('📖 [DEBUG] Metadata: ${transPara.metadata.keys.join(", ")}');
+  return transPara;
+}
+
+// Resolve font from paragraph style hierarchy
+String _getResolvedFontName(XmlElement paraElem) {
+  print('🔍 [DEBUG] _getResolvedFontName() START');
+  
+  // 1. Check runs first (highest priority)
+  for (final run in paraElem.findAllElements('w:r')) {
+    final rPr = run.findElements('w:rPr').firstOrNull;
+    if (rPr != null) {
+      final rFonts = rPr.findElements('w:rFonts').firstOrNull;
+      if (rFonts != null) {
+        final fontName = rFonts.getAttribute('w:ascii') ?? 
+                        rFonts.getAttribute('w:hAnsi');
+        if (fontName != null && fontName.isNotEmpty) {
+          print('🔍 [DEBUG] Found font in run: $fontName');
+          return fontName;
+        }
+      }
+    }
+  }
+  
+  // 2. Check paragraph style
+  final pPr = paraElem.findElements('w:pPr').firstOrNull;
+  if (pPr != null) {
+    final pStyle = pPr.findElements('w:pStyle').firstOrNull;
+    if (pStyle != null) {
+      final styleName = pStyle.getAttribute('w:val');
+      print('🔍 [DEBUG] Paragraph has style: $styleName');
+      
+      // In a full implementation, you would:
+      // - Load styles.xml from the archive
+      // - Walk the style hierarchy to find font definitions
+      // - This requires access to the archive in this method
+      // For now, we use sensible defaults based on common style names
+      
+      if (styleName != null) {
+        if (styleName.toLowerCase().contains('heading')) {
+          print('🔍 [DEBUG] Heading style detected, using Calibri Light');
+          return 'Calibri Light';
+        }
+        if (styleName.toLowerCase().contains('title')) {
+          print('🔍 [DEBUG] Title style detected, using Calibri Light');
+          return 'Calibri Light';
+        }
+      }
+    }
+    
+    // Check if pPr itself has font info (rare but possible)
+    final rPr = pPr.findElements('w:rPr').firstOrNull;
+    if (rPr != null) {
+      final rFonts = rPr.findElements('w:rFonts').firstOrNull;
+      if (rFonts != null) {
+        final fontName = rFonts.getAttribute('w:ascii') ?? 
+                        rFonts.getAttribute('w:hAnsi');
+        if (fontName != null && fontName.isNotEmpty) {
+          print('🔍 [DEBUG] Found font in pPr: $fontName');
+          return fontName;
+        }
+      }
+    }
+  }
+  
+  // 3. Fallback to Word's default body font
+  print('🔍 [DEBUG] No font found, using default: Calibri');
+  return 'Calibri';
+}
 
   String _extractRunText(XmlElement rElem) {
     final buffer = StringBuffer();
@@ -1019,213 +1109,345 @@ class DocxTranslator {
   }
 
   void applyAlignedFormatting(
-    XmlElement paraElem,
-    TranslatableParagraph transPara,
-    String translatedText,
-    List<Alignment> alignment,
-  ) {
-    print('✨ [DEBUG] applyAlignedFormatting() START');
-    print('🔍 [DEBUG] Original: "${transPara.getText()}"');
-    print('🔍 [DEBUG] Translated: "$translatedText"');
-    print('🔍 [DEBUG] Alignments: ${alignment.length}');
+  XmlElement paraElem,
+  TranslatableParagraph transPara,
+  String translatedText,
+  List<Alignment> alignment,
+) {
+  print('✨ [DEBUG] applyAlignedFormatting() START');
+  print('🔍 [DEBUG] Original: "${transPara.getText()}"');
+  print('🔍 [DEBUG] Translated: "$translatedText"');
+  print('🔍 [DEBUG] Alignments: ${alignment.length}');
 
-    final fontTemplate = transPara.runs.isNotEmpty ? transPara.runs[0] : null;
-    print('🔍 [DEBUG] Font template: ${fontTemplate != null ? fontTemplate.fontName : "NULL"}');
+  final fontTemplate = transPara.runs.isNotEmpty ? transPara.runs[0] : null;
+  print('🔍 [DEBUG] Font template: ${fontTemplate != null ? "${fontTemplate.fontName}@${fontTemplate.fontSize}pt" : "NULL"}');
+  
+  // ✅ CRITICAL: Extract footnote references BEFORE clearing
+  final footnoteRuns = <XmlElement>[];
+  for (final run in paraElem.findElements('w:r')) {
+    // Check if this run contains a footnote reference
+    final hasFootnoteRef = run.descendants.any((d) => 
+      d is XmlElement && (d.name.local == 'footnoteReference' || d.name.local == 'footnoteRef')
+    );
     
-    // STEP 1: Restore paragraph-level metadata
-    final pPr = paraElem.findElements('w:pPr').firstOrNull;
-    if (pPr != null && transPara.metadata.isNotEmpty) {
-      // Restore alignment
-      if (transPara.metadata.containsKey('alignment')) {
-        var jc = pPr.findElements('w:jc').firstOrNull;
-        if (jc == null) {
-          jc = XmlElement(XmlName('w:jc'));
-          pPr.children.add(jc);
-        }
-        jc.setAttribute('w:val', transPara.metadata['alignment']);
-      }
-      
-      // Restore indentation
-      if (transPara.metadata.containsKey('indLeft')) {
-        var ind = pPr.findElements('w:ind').firstOrNull;
-        if (ind == null) {
-          ind = XmlElement(XmlName('w:ind'));
-          pPr.children.add(ind);
-        }
-        if (transPara.metadata['indLeft'] != null) {
-          ind.setAttribute('w:left', transPara.metadata['indLeft']);
-        }
-        if (transPara.metadata['indRight'] != null) {
-          ind.setAttribute('w:right', transPara.metadata['indRight']);
-        }
-        if (transPara.metadata['indFirstLine'] != null) {
-          ind.setAttribute('w:firstLine', transPara.metadata['indFirstLine']);
-        }
-      }
-      
-      // Restore spacing
-      if (transPara.metadata.containsKey('spaceBefore')) {
-        var spacing = pPr.findElements('w:spacing').firstOrNull;
-        if (spacing == null) {
-          spacing = XmlElement(XmlName('w:spacing'));
-          pPr.children.add(spacing);
-        }
-        if (transPara.metadata['spaceBefore'] != null) {
-          spacing.setAttribute('w:before', transPara.metadata['spaceBefore']);
-        }
-        if (transPara.metadata['spaceAfter'] != null) {
-          spacing.setAttribute('w:after', transPara.metadata['spaceAfter']);
-        }
-        if (transPara.metadata['lineRule'] != null) {
-          spacing.setAttribute('w:lineRule', transPara.metadata['lineRule']);
-        }
-        if (transPara.metadata['line'] != null) {
-          spacing.setAttribute('w:line', transPara.metadata['line']);
-        }
-      }
+    if (hasFootnoteRef) {
+      footnoteRuns.add(run.copy());
+      print('📎 [DEBUG] Saved footnote reference run');
     }
-    
-    // STEP 2: Clear existing runs
-    final existingRuns = paraElem.findElements('w:r').toList();
-    for (final run in existingRuns) {
-      paraElem.children.remove(run);
+  }
+  
+  // STEP 1: FORCE RESTORE PARAGRAPH-LEVEL METADATA
+  var pPr = paraElem.findElements('w:pPr').firstOrNull;
+  
+  if (pPr == null && transPara.metadata.isNotEmpty) {
+    print('🔧 [DEBUG] Creating missing w:pPr element');
+    pPr = XmlElement(XmlName('w:pPr'));
+    paraElem.children.insert(0, pPr);
+  }
+  
+  if (pPr != null && transPara.metadata.isNotEmpty) {
+    print('🔧 [DEBUG] Restoring paragraph properties...');
+    _restoreStyle(pPr, transPara.metadata);
+    _restoreNumbering(pPr, transPara.metadata);
+    _restoreAlignment(pPr, transPara.metadata);
+    _restoreIndentation(pPr, transPara.metadata);
+    _restoreSpacing(pPr, transPara.metadata);
+  }
+  
+  // STEP 2: Clear existing runs (AFTER extracting footnote refs)
+  final existingRuns = paraElem.findElements('w:r').toList();
+  for (final run in existingRuns) {
+    paraElem.children.remove(run);
+  }
+  print('🗑️  [DEBUG] Cleared ${existingRuns.length} existing runs');
+  
+  // STEP 3: Prepare alignment mapping
+  final srcCleanWords = transPara.getWords();
+  final tgtRawUnits = translatedText.split(RegExp(r'\s+'));
+  final formattedIndices = transPara.getFormattedWordIndices();
+  
+  print('🔍 [DEBUG] Source clean words: $srcCleanWords');
+  print('🔍 [DEBUG] Target raw units: $tgtRawUnits');
+  
+  // Map clean target indices to raw unit indices
+  final cleanToRawTgt = <int, int>{};
+  int cleanIdx = 0;
+  for (int rawIdx = 0; rawIdx < tgtRawUnits.length; rawIdx++) {
+    final unit = tgtRawUnits[rawIdx];
+    if (RegExp(r'[\p{L}\p{N}]', unicode: true).hasMatch(unit)) {
+      cleanToRawTgt[cleanIdx] = rawIdx;
+      cleanIdx++;
     }
-    print('🗑️  [DEBUG] Cleared ${existingRuns.length} existing runs');
+  }
+  
+  // STEP 4: Reconstruct runs with aligned formatting
+  print('🔧 [DEBUG] Reconstructing ${tgtRawUnits.length} runs...');
+  
+  for (int i = 0; i < tgtRawUnits.length; i++) {
+    final unit = tgtRawUnits[i];
+    final runText = i < tgtRawUnits.length - 1 ? '$unit ' : unit;
     
-    // STEP 3: Prepare alignment mapping
-    final srcCleanWords = transPara.getWords();
-    final tgtRawUnits = translatedText.split(RegExp(r'\s+'));
-    final formattedIndices = transPara.getFormattedWordIndices();
+    // Determine style from alignment
+    String? styleType;
+    final cleanIdxForThisRaw = cleanToRawTgt.entries
+        .firstWhere((e) => e.value == i, orElse: () => MapEntry(-1, -1))
+        .key;
     
-    print('🔍 [DEBUG] Source clean words: $srcCleanWords');
-    print('🔍 [DEBUG] Target raw units: $tgtRawUnits');
-    
-    // Map clean target indices to raw unit indices
-    final cleanToRawTgt = <int, int>{};
-    int cleanIdx = 0;
-    for (int rawIdx = 0; rawIdx < tgtRawUnits.length; rawIdx++) {
-      final unit = tgtRawUnits[rawIdx];
-      // Only count as "word" if it has alphanumeric
-      if (RegExp(r'\w').hasMatch(unit)) {
-        cleanToRawTgt[cleanIdx] = rawIdx;
-        print('🔍 [DEBUG] Clean[$cleanIdx] → Raw[$rawIdx] "$unit"');
-        cleanIdx++;
-      }
-    }
-    
-    // STEP 4: Reconstruct runs with aligned formatting
-    for (int i = 0; i < tgtRawUnits.length; i++) {
-      final unit = tgtRawUnits[i];
-      final runText = i < tgtRawUnits.length - 1 ? '$unit ' : unit;
-      
-      // Determine style from alignment
-      String? styleType;
-      final matchedSrc = <int>[];
-      
+    if (cleanIdxForThisRaw >= 0) {
       for (final align in alignment) {
-        if (cleanToRawTgt[align.targetIndex] == i) { // Use targetIndex
-          matchedSrc.add(align.sourceIndex); // Use sourceIndex
-        }
-      }
-      
-      if (matchedSrc.isNotEmpty) {
-        for (final sIdx in matchedSrc) {
+        if (align.targetIndex == cleanIdxForThisRaw) {
+          final sIdx = align.sourceIndex;
           if (formattedIndices['italic_bold']!.contains(sIdx)) {
             styleType = 'italic_bold';
             break;
           } else if (formattedIndices['bold']!.contains(sIdx)) {
-            styleType = 'bold';
+            styleType = styleType == null ? 'bold' : styleType;
           } else if (formattedIndices['italic']!.contains(sIdx) && styleType != 'bold') {
             styleType = 'italic';
           }
         }
       }
-      
-      print('🔍 [DEBUG] Unit[$i] "$unit" → style: $styleType, matched src: $matchedSrc');
-      
-      // Create new run
-      final newRun = _createFormattedRun(
-        text: runText,
-        styleType: styleType,
-        fontTemplate: fontTemplate,
-      );
-      
-      paraElem.children.add(newRun);
     }
     
-    print('✨ [DEBUG] Created ${tgtRawUnits.length} new runs');
+    final newRun = _createFormattedRun(
+      text: runText,
+      styleType: styleType,
+      fontTemplate: fontTemplate,
+    );
+    
+    paraElem.children.add(newRun);
   }
+  
+  // ✅ STEP 5: RE-ATTACH FOOTNOTE REFERENCES AT END
+  if (footnoteRuns.isNotEmpty) {
+    print('📎 [DEBUG] Re-attaching ${footnoteRuns.length} footnote references');
+    for (final footnoteRun in footnoteRuns) {
+      paraElem.children.add(footnoteRun);
+    }
+  }
+  
+  print('✨ [DEBUG] Created ${tgtRawUnits.length} new runs + ${footnoteRuns.length} footnote refs');
+  print('✨ [DEBUG] applyAlignedFormatting() COMPLETE');
+}
+
+// ✅ HELPER: Restore paragraph style
+void _restoreStyle(XmlElement pPr, Map<String, dynamic> metadata) {
+  if (metadata.containsKey('style') && metadata['style'] != null) {
+    final styleName = metadata['style'] as String;
+    print('🔧 [DEBUG] Restoring style: $styleName');
+    
+    var pStyle = pPr.findElements('w:pStyle').firstOrNull;
+    if (pStyle == null) {
+      pStyle = XmlElement(XmlName('w:pStyle'));
+      // pStyle should be first in pPr
+      pPr.children.insert(0, pStyle);
+    }
+    pStyle.setAttribute('w:val', styleName);
+  }
+}
+
+// ✅ HELPER: Restore numbering (for lists)
+void _restoreNumbering(XmlElement pPr, Map<String, dynamic> metadata) {
+  if (metadata.containsKey('numId') && metadata['numId'] != null) {
+    print('🔧 [DEBUG] Restoring numbering: numId=${metadata['numId']}, level=${metadata['numLevel']}');
+    
+    var numPr = pPr.findElements('w:numPr').firstOrNull;
+    if (numPr == null) {
+      numPr = XmlElement(XmlName('w:numPr'));
+      // Add after pStyle if it exists, otherwise at beginning
+      final pStyle = pPr.findElements('w:pStyle').firstOrNull;
+      if (pStyle != null) {
+        final idx = pPr.children.indexOf(pStyle) + 1;
+        pPr.children.insert(idx, numPr);
+      } else {
+        pPr.children.insert(0, numPr);
+      }
+    }
+    
+    // Clear existing numbering children
+    numPr.children.clear();
+    
+    // Add ilvl (level)
+    if (metadata.containsKey('numLevel')) {
+      final ilvl = XmlElement(XmlName('w:ilvl'));
+      ilvl.setAttribute('w:val', metadata['numLevel'].toString());
+      numPr.children.add(ilvl);
+    }
+    
+    // Add numId
+    final numId = XmlElement(XmlName('w:numId'));
+    numId.setAttribute('w:val', metadata['numId'].toString());
+    numPr.children.add(numId);
+  }
+}
+
+// ✅ HELPER: Restore alignment
+void _restoreAlignment(XmlElement pPr, Map<String, dynamic> metadata) {
+  if (metadata.containsKey('alignment') && metadata['alignment'] != null) {
+    print('🔧 [DEBUG] Restoring alignment: ${metadata['alignment']}');
+    
+    var jc = pPr.findElements('w:jc').firstOrNull;
+    if (jc == null) {
+      jc = XmlElement(XmlName('w:jc'));
+      pPr.children.add(jc);
+    }
+    jc.setAttribute('w:val', metadata['alignment'].toString());
+  }
+}
+
+// ✅ HELPER: Restore indentation
+void _restoreIndentation(XmlElement pPr, Map<String, dynamic> metadata) {
+  if (metadata.containsKey('indLeft') || 
+      metadata.containsKey('indRight') || 
+      metadata.containsKey('indFirstLine') ||
+      metadata.containsKey('indHanging')) {
+    print('🔧 [DEBUG] Restoring indentation: L=${metadata['indLeft']}, R=${metadata['indRight']}, First=${metadata['indFirstLine']}');
+    
+    var ind = pPr.findElements('w:ind').firstOrNull;
+    if (ind == null) {
+      ind = XmlElement(XmlName('w:ind'));
+      pPr.children.add(ind);
+    }
+    
+    // Clear existing attributes
+    ind.attributes.clear();
+    
+    // Set all indentation values
+    if (metadata['indLeft'] != null) {
+      ind.setAttribute('w:left', metadata['indLeft'].toString());
+    }
+    if (metadata['indRight'] != null) {
+      ind.setAttribute('w:right', metadata['indRight'].toString());
+    }
+    if (metadata['indFirstLine'] != null) {
+      ind.setAttribute('w:firstLine', metadata['indFirstLine'].toString());
+    }
+    if (metadata['indHanging'] != null) {
+      ind.setAttribute('w:hanging', metadata['indHanging'].toString());
+    }
+  }
+}
+
+// ✅ HELPER: Restore spacing
+void _restoreSpacing(XmlElement pPr, Map<String, dynamic> metadata) {
+  if (metadata.containsKey('spaceBefore') || 
+      metadata.containsKey('spaceAfter') ||
+      metadata.containsKey('lineRule') ||
+      metadata.containsKey('line')) {
+    print('🔧 [DEBUG] Restoring spacing: Before=${metadata['spaceBefore']}, After=${metadata['spaceAfter']}, Line=${metadata['line']}');
+    
+    var spacing = pPr.findElements('w:spacing').firstOrNull;
+    if (spacing == null) {
+      spacing = XmlElement(XmlName('w:spacing'));
+      pPr.children.add(spacing);
+    }
+    
+    // Clear existing attributes
+    spacing.attributes.clear();
+    
+    // Set all spacing values
+    if (metadata['spaceBefore'] != null) {
+      spacing.setAttribute('w:before', metadata['spaceBefore'].toString());
+    }
+    if (metadata['spaceAfter'] != null) {
+      spacing.setAttribute('w:after', metadata['spaceAfter'].toString());
+    }
+    if (metadata['lineRule'] != null) {
+      spacing.setAttribute('w:lineRule', metadata['lineRule'].toString());
+    }
+    if (metadata['line'] != null) {
+      spacing.setAttribute('w:line', metadata['line'].toString());
+    }
+  }
+}
 
   XmlElement _createFormattedRun({
-    required String text,
-    String? styleType,
-    FormatRun? fontTemplate,
-  }) {
-    final builder = XmlBuilder();
+  required String text,
+  String? styleType,
+  FormatRun? fontTemplate,
+}) {
+  print('🔨 [DEBUG] Creating run: "$text" | style=$styleType | font=${fontTemplate?.fontName}');
+  
+  // ✅ Create w:r element directly
+  final rElem = XmlElement(XmlName('w:r'));
+  
+  // Only add rPr if we have formatting
+  if (styleType != null || fontTemplate != null) {
+    final rPr = XmlElement(XmlName('w:rPr'));
     
-    builder.element('w:r', nest: () {
-      // Only add rPr if we have formatting to apply
-      if (styleType != null || fontTemplate != null) {
-        builder.element('w:rPr', nest: () {
-          // Apply inline styles from alignment
-          if (styleType == 'italic_bold') {
-            builder.element('w:b');
-            builder.element('w:i');
-          } else if (styleType == 'bold') {
-            builder.element('w:b');
-          } else if (styleType == 'italic') {
-            builder.element('w:i');
-          }
-          
-          // Apply baseline aesthetics from template
-          if (fontTemplate != null) {
-            // Font name (CRITICAL: Use w:rFonts with all variants)
-            if (fontTemplate.fontName != null) {
-              builder.element('w:rFonts', attributes: {
-                'w:ascii': fontTemplate.fontName!,
-                'w:hAnsi': fontTemplate.fontName!,
-                'w:eastAsia': fontTemplate.fontName!,
-                'w:cs': fontTemplate.fontName!,
-              });
-            }
-            
-            // Font size (in half-points)
-            if (fontTemplate.fontSize != null) {
-              builder.element('w:sz', attributes: {
-                'w:val': (fontTemplate.fontSize! * 2).toInt().toString(),
-              });
-            }
-            
-            // Font color
-            if (fontTemplate.fontColor != null) {
-              builder.element('w:color', attributes: {
-                'w:val': fontTemplate.fontColor!.toHex(),
-              });
-            }
-            
-            // Underline
-            if (fontTemplate.underline == true) {
-              builder.element('w:u', attributes: {
-                'w:val': 'single',
-              });
-            }
-          }
-        });
+    // ✅ Apply inline styles from alignment (bold/italic)
+    if (styleType == 'italic_bold') {
+      rPr.children.add(XmlElement(XmlName('w:b')));
+      rPr.children.add(XmlElement(XmlName('w:i')));
+      print('  → Applied: BOLD + ITALIC');
+    } else if (styleType == 'bold') {
+      rPr.children.add(XmlElement(XmlName('w:b')));
+      print('  → Applied: BOLD');
+    } else if (styleType == 'italic') {
+      rPr.children.add(XmlElement(XmlName('w:i')));
+      print('  → Applied: ITALIC');
+    }
+    
+    // ✅ Apply baseline aesthetics from template
+    if (fontTemplate != null) {
+      // Font name - ALL 4 ATTRIBUTES
+      if (fontTemplate.fontName != null) {
+        final rFonts = XmlElement(XmlName('w:rFonts'));
+        rFonts.setAttribute('w:ascii', fontTemplate.fontName!);
+        rFonts.setAttribute('w:hAnsi', fontTemplate.fontName!);
+        rFonts.setAttribute('w:eastAsia', fontTemplate.fontName!);
+        rFonts.setAttribute('w:cs', fontTemplate.fontName!);
+        rPr.children.add(rFonts);
+        print('  → Font: ${fontTemplate.fontName} (all 4 attributes)');
       }
       
-      // Add text element with space preservation
-      builder.element('w:t', 
-        nest: text,
-        attributes: {
-          if (text.startsWith(' ') || text.endsWith(' ')) 
-            'xml:space': 'preserve',
-        }
-      );
-    });
+      // Font size - BOTH w:sz AND w:szCs
+      if (fontTemplate.fontSize != null) {
+        final halfPoints = (fontTemplate.fontSize! * 2).toInt().toString();
+        
+        final sz = XmlElement(XmlName('w:sz'));
+        sz.setAttribute('w:val', halfPoints);
+        rPr.children.add(sz);
+        
+        final szCs = XmlElement(XmlName('w:szCs'));
+        szCs.setAttribute('w:val', halfPoints);
+        rPr.children.add(szCs);
+        
+        print('  → Size: ${fontTemplate.fontSize}pt (half-points: $halfPoints)');
+      }
+      
+      // Font color
+      if (fontTemplate.fontColor != null) {
+        final color = XmlElement(XmlName('w:color'));
+        color.setAttribute('w:val', fontTemplate.fontColor!.toHex());
+        rPr.children.add(color);
+        print('  → Color: ${fontTemplate.fontColor!.toHex()}');
+      }
+      
+      // Underline
+      if (fontTemplate.underline == true) {
+        final u = XmlElement(XmlName('w:u'));
+        u.setAttribute('w:val', 'single');
+        rPr.children.add(u);
+        print('  → Underline: single');
+      }
+    }
     
-    // CRITICAL: Use copy() to detach from builder's document
-    return builder.buildDocument().rootElement.copy() as XmlElement;
+    rElem.children.add(rPr);
   }
+  
+  // ✅ Add text element
+  final tElem = XmlElement(XmlName('w:t'));
+  tElem.innerText = text;
+  
+  if (text.startsWith(' ') || text.endsWith(' ')) {
+    tElem.setAttribute('xml:space', 'preserve');
+  }
+  
+  rElem.children.add(tElem);
+  
+  return rElem;
+}
 
 // Helper method to create a deep copy of an XML element
 XmlElement _deepCopyElement(XmlElement element) {

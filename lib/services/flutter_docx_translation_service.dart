@@ -32,125 +32,341 @@ class FlutterDocxTranslationService {
   }
   
   Future<Uint8List> translateDocx({
-    required Uint8List inputBytes,
-    required String sourceLang,
-    required String targetLang,
-    required Function(DocxTranslationProgress) onProgress,
-    required Function(String, String, List<Alignment>) onSegmentTranslated,
-    }) async {
-    print('🔧 [FLUTTER-DOCX] ==================== TRANSLATION START ====================');
-    print('🔧 [FLUTTER-DOCX] Source: $sourceLang → Target: $targetLang');
+  required Uint8List inputBytes,
+  required String sourceLang,
+  required String targetLang,
+  required Function(DocxTranslationProgress) onProgress,
+  required Function(String, String, List<Alignment>) onSegmentTranslated,
+}) async {
+  print('🔧 [FLUTTER-DOCX] ==================== TRANSLATION START ====================');
+  print('🔧 [FLUTTER-DOCX] Source: $sourceLang → Target: $targetLang');
+  print('🔧 [FLUTTER-DOCX] Input size: ${inputBytes.length} bytes');
+  
+  // Initialize aligner if not done yet
+  if (_aligner == null || !_aligner!.isInitialized) {
+    await initialize();
+  }
+  
+  final aligner = _aligner ?? HeuristicAligner();
+  print('🔧 [FLUTTER-DOCX] Using aligner: ${_aligner != null ? "ONNX BERT" : "Heuristic"}');
+  
+  // ===== STEP 1: Decode and parse DOCX =====
+  print('\n📦 [FLUTTER-DOCX] ===== STEP 1: DECODE DOCX =====');
+  final archive = ZipDecoder().decodeBytes(inputBytes);
+  print('📦 [FLUTTER-DOCX] Archive contains ${archive.files.length} files');
+  
+  // ===== STEP 2: Parse document.xml =====
+  print('\n📄 [FLUTTER-DOCX] ===== STEP 2: PARSE DOCUMENT.XML =====');
+  final docXml = _getFileFromArchive(archive, 'word/document.xml');
+  final docString = utf8.decode(docXml.content as List<int>);
+  final document = XmlDocument.parse(docString);
+  
+  final body = document.findAllElements('w:body').firstOrNull;
+  if (body == null) {
+    throw Exception('No w:body found in document.xml');
+  }
+  
+  // Extract body paragraphs
+  final bodyParagraphs = <XmlElement>[];
+  _extractParagraphsFromBody(body, bodyParagraphs);
+  
+  print('📄 [FLUTTER-DOCX] Found ${bodyParagraphs.length} paragraphs in document body');
+  
+  // ===== STEP 3: Parse footnotes.xml if exists =====
+  print('\n📝 [FLUTTER-DOCX] ===== STEP 3: PARSE FOOTNOTES.XML =====');
+  XmlDocument? footnotesDoc;
+  List<XmlElement> footnoteParagraphs = [];
+  
+  try {
+    final footnotesXml = _getFileFromArchive(archive, 'word/footnotes.xml');
+    final footnotesString = utf8.decode(footnotesXml.content as List<int>);
+    footnotesDoc = XmlDocument.parse(footnotesString);
     
-    // Initialize aligner if not done yet
-    if (_aligner == null || !_aligner!.isInitialized) {
-        await initialize();
+    // Extract paragraphs from footnotes (skip special markers with id <= 0)
+    for (final footnote in footnotesDoc.findAllElements('w:footnote')) {
+      final id = footnote.getAttribute('w:id');
+      final parsedId = id != null ? int.tryParse(id) : null;
+      
+      if (parsedId != null && parsedId > 0) {
+        for (final child in footnote.children.whereType<XmlElement>()) {
+          if (child.name.local == 'p') {
+            footnoteParagraphs.add(child);
+          }
+        }
+      }
     }
     
-    final aligner = _aligner ?? HeuristicAligner();
-    print('🔧 [FLUTTER-DOCX] Using aligner: ${_aligner != null ? "ONNX BERT" : "Heuristic"}');
+    print('📝 [FLUTTER-DOCX] Found ${footnoteParagraphs.length} paragraphs in footnotes');
+  } catch (e) {
+    print('ℹ️  [FLUTTER-DOCX] No footnotes.xml: $e');
+  }
+  
+  // ===== STEP 4: Count translatable segments =====
+  print('\n📊 [FLUTTER-DOCX] ===== STEP 4: COUNT SEGMENTS =====');
+  
+  int translatableBodyCount = 0;
+  for (final para in bodyParagraphs) {
+    if (para.innerText.trim().isNotEmpty) {
+      translatableBodyCount++;
+    }
+  }
+  
+  int translatableFootnoteCount = 0;
+  for (final para in footnoteParagraphs) {
+    if (para.innerText.trim().isNotEmpty) {
+      translatableFootnoteCount++;
+    }
+  }
+  
+  final totalSegments = translatableBodyCount + translatableFootnoteCount;
+  int completedSegments = 0;
+  
+  print('📊 [FLUTTER-DOCX] Total segments: $totalSegments');
+  print('   Body: $translatableBodyCount');
+  print('   Footnotes: $translatableFootnoteCount');
+  
+  // Create translator instance
+  final translator = DocxTranslator(
+    translationService: _ONNXTranslationServiceWrapper(onnxService),
+    aligner: aligner,
+    verbose: verbose,
+  );
+  
+  // ===== STEP 5: Translate BODY paragraphs =====
+  print('\n📄 [FLUTTER-DOCX] ===== STEP 5: TRANSLATE BODY PARAGRAPHS =====');
+  
+  for (int i = 0; i < bodyParagraphs.length; i++) {
+    final paraElem = bodyParagraphs[i];
+    final originalText = paraElem.innerText.trim();
     
-    // Decode DOCX
-    final archive = ZipDecoder().decodeBytes(inputBytes);
-    final docXml = _getFileFromArchive(archive, 'word/document.xml');
-    final docString = utf8.decode(docXml.content as List<int>);
-    final document = XmlDocument.parse(docString);
+    if (originalText.isEmpty) {
+      print('⏭️  [PARA ${i + 1}/${bodyParagraphs.length}] Skipping empty paragraph');
+      continue;
+    }
     
-    final paragraphs = document.findAllElements('w:p').toList();
-    print('📄 [FLUTTER-DOCX] Found ${paragraphs.length} paragraphs');
+    print('\n📝 [PARA ${i + 1}/${bodyParagraphs.length}] Original: "${originalText.substring(0, originalText.length > 60 ? 60 : originalText.length)}..."');
     
-    int totalSegments = paragraphs.where((p) => p.innerText.trim().isNotEmpty).length;
-    int completedSegments = 0;
-    
-    // Create translator instance with extractParagraph method
-    final translator = DocxTranslator(
-        translationService: _ONNXTranslationServiceWrapper(onnxService),
-        aligner: aligner,
-        verbose: verbose,
-    );
-    
-    // Process each paragraph
-    for (final paraElem in paragraphs) {
-        final originalText = paraElem.innerText.trim();
-        if (originalText.isEmpty) continue;
-        
-        print('\n📝 [PARA] Processing: "${originalText.substring(0, originalText.length > 50 ? 50 : originalText.length)}..."');
-        
-        try {
-        // STEP 1: Extract with formatting
-        final transPara = translator.extractParagraph(paraElem);
-        
-        // STEP 2: Translate
-        final translatedText = await onnxService.translate(
-            originalText,
-            targetLang,
-            sourceLanguage: sourceLang,
-        );
-        
-        print('📝 [PARA] Translated: "${translatedText.substring(0, translatedText.length > 50 ? 50 : translatedText.length)}..."');
-        
-        // STEP 3: Get alignments (CLEAN WORDS ONLY)
-        final srcCleanWords = transPara.getWords();
-
-        // ✅ FIX: Unicode-aware word extraction for German
-        final tgtCleanWords = RegExp(r'[\p{L}\p{N}]+', unicode: true)
-            .allMatches(translatedText)
-            .map((m) => m.group(0)!)
-            .toList();
-
-        print('🔗 [PARA] Aligning: ${srcCleanWords.length} → ${tgtCleanWords.length}');
-        final alignments = aligner.align(srcCleanWords, tgtCleanWords);
-        
-        print('🔗 [PARA] Got ${alignments.length} alignments');
-        
-        // STEP 4: Reconstruct with aligned formatting
-        translator.applyAlignedFormatting(
-            paraElem,
-            transPara,
-            translatedText,
-            alignments,
-        );
-        
-        // Progress callback
-        completedSegments++;
-        onProgress(DocxTranslationProgress(
+    try {
+      await _translateParagraph(
+        paraElem, 
+        translator, 
+        sourceLang, 
+        targetLang, 
+        aligner,
+        (translated, alignments) {
+          completedSegments++;
+          onProgress(DocxTranslationProgress(
             totalSegments: totalSegments,
             completedSegments: completedSegments,
-            currentSegment: originalText.length > 50 
-            ? '${originalText.substring(0, 50)}...' 
-            : originalText,
-        ));
-        
-        onSegmentTranslated(originalText, translatedText, alignments);
-        
-        } catch (e, stack) {
-        print('❌ [PARA] Failed: $e');
-        if (verbose) print(stack);
-        }
+            currentSegment: originalText.length > 50 ? '${originalText.substring(0, 50)}...' : originalText,
+          ));
+          onSegmentTranslated(originalText, translated, alignments);
+        },
+      );
+    } catch (e, stack) {
+      print('❌ [PARA ${i + 1}] Translation failed: $e');
+      if (verbose) print(stack);
+      // Continue with next paragraph instead of failing completely
     }
-    
-    // Re-encode DOCX
-    final modifiedXml = document.toXmlString(pretty: false);
-    
-    // Replace document.xml in archive
-    final newArchive = Archive();
-    for (final file in archive.files) {
-        if (file.name == 'word/document.xml') {
-        newArchive.addFile(ArchiveFile(
-            file.name,
-            modifiedXml.length,
-            utf8.encode(modifiedXml),
-        ));
-        } else {
-        newArchive.addFile(file);
-        }
-    }
-    
-    final outputBytes = ZipEncoder().encode(newArchive)!;
-    print('✅ [FLUTTER-DOCX] ==================== TRANSLATION COMPLETE ====================');
-    
-    return Uint8List.fromList(outputBytes);
-    }
+  }
   
+  // ===== STEP 6: Translate FOOTNOTE paragraphs =====
+  if (footnoteParagraphs.isNotEmpty) {
+    print('\n📝 [FLUTTER-DOCX] ===== STEP 6: TRANSLATE FOOTNOTES =====');
+    
+    for (int i = 0; i < footnoteParagraphs.length; i++) {
+      final paraElem = footnoteParagraphs[i];
+      final originalText = paraElem.innerText.trim();
+      
+      if (originalText.isEmpty) {
+        print('⏭️  [FOOTNOTE ${i + 1}/${footnoteParagraphs.length}] Skipping empty');
+        continue;
+      }
+      
+      print('\n📝 [FOOTNOTE ${i + 1}/${footnoteParagraphs.length}] Original: "${originalText.substring(0, originalText.length > 60 ? 60 : originalText.length)}..."');
+      
+      try {
+        await _translateParagraph(
+          paraElem, 
+          translator, 
+          sourceLang, 
+          targetLang, 
+          aligner,
+          (translated, alignments) {
+            completedSegments++;
+            onProgress(DocxTranslationProgress(
+              totalSegments: totalSegments,
+              completedSegments: completedSegments,
+              currentSegment: originalText.length > 50 ? '${originalText.substring(0, 50)}...' : originalText,
+            ));
+            onSegmentTranslated(originalText, translated, alignments);
+          },
+        );
+      } catch (e, stack) {
+        print('❌ [FOOTNOTE ${i + 1}] Translation failed: $e');
+        if (verbose) print(stack);
+      }
+    }
+  }
+  
+  // ===== STEP 7: Validate XML before serializing =====
+  print('\n✅ [FLUTTER-DOCX] ===== STEP 7: VALIDATE XML =====');
+  
+  try {
+    final testDoc = document.toXmlString(pretty: false, preserveWhitespace: (node) => true);
+    XmlDocument.parse(testDoc);
+    print('✅ [VALIDATE] document.xml is valid');
+  } catch (e) {
+    print('❌ [VALIDATE] document.xml is INVALID: $e');
+    throw Exception('Generated invalid document.xml: $e');
+  }
+  
+  if (footnotesDoc != null) {
+    try {
+      final testFootnotes = footnotesDoc.toXmlString(pretty: false, preserveWhitespace: (node) => true);
+      XmlDocument.parse(testFootnotes);
+      print('✅ [VALIDATE] footnotes.xml is valid');
+    } catch (e) {
+      print('❌ [VALIDATE] footnotes.xml is INVALID: $e');
+      throw Exception('Generated invalid footnotes.xml: $e');
+    }
+  }
+  
+  // ===== STEP 8: Serialize modified XMLs =====
+  print('\n📦 [FLUTTER-DOCX] ===== STEP 8: SERIALIZE XML =====');
+  
+  final modifiedDocXml = document.toXmlString(
+    pretty: false,
+    preserveWhitespace: (node) => true,
+  );
+  print('📦 [FLUTTER-DOCX] document.xml: ${modifiedDocXml.length} bytes');
+  
+  String? modifiedFootnotesXml;
+  if (footnotesDoc != null) {
+    modifiedFootnotesXml = footnotesDoc.toXmlString(
+      pretty: false,
+      preserveWhitespace: (node) => true,
+    );
+    print('📦 [FLUTTER-DOCX] footnotes.xml: ${modifiedFootnotesXml.length} bytes');
+  }
+  
+  // ===== STEP 9: Rebuild archive =====
+  print('\n📦 [FLUTTER-DOCX] ===== STEP 9: REBUILD ARCHIVE =====');
+  
+  final newArchive = Archive();
+  int filesReplaced = 0;
+  int filesKept = 0;
+  
+  for (final file in archive.files) {
+    if (file.name == 'word/document.xml') {
+      newArchive.addFile(ArchiveFile(
+        file.name,
+        modifiedDocXml.length,
+        utf8.encode(modifiedDocXml),
+      )..compress = true);
+      filesReplaced++;
+      print('✅ [ARCHIVE] Replaced: ${file.name}');
+    } else if (file.name == 'word/footnotes.xml' && modifiedFootnotesXml != null) {
+      newArchive.addFile(ArchiveFile(
+        file.name,
+        modifiedFootnotesXml.length,
+        utf8.encode(modifiedFootnotesXml),
+      )..compress = true);
+      filesReplaced++;
+      print('✅ [ARCHIVE] Replaced: ${file.name}');
+    } else {
+      newArchive.addFile(file);
+      filesKept++;
+    }
+  }
+  
+  print('📦 [FLUTTER-DOCX] Archive rebuilt: $filesReplaced replaced, $filesKept kept');
+  
+  // ===== STEP 10: Encode final DOCX =====
+  print('\n📦 [FLUTTER-DOCX] ===== STEP 10: ENCODE FINAL DOCX =====');
+  
+  final outputBytes = ZipEncoder().encode(newArchive)!;
+  
+  print('✅ [FLUTTER-DOCX] ==================== TRANSLATION COMPLETE ====================');
+  print('📦 [FLUTTER-DOCX] Input size: ${inputBytes.length} bytes');
+  print('📦 [FLUTTER-DOCX] Output size: ${outputBytes.length} bytes');
+  print('📊 [FLUTTER-DOCX] Segments translated: $completedSegments/$totalSegments');
+  print('   Success rate: ${(completedSegments / totalSegments * 100).toStringAsFixed(1)}%');
+  print('=' * 80);
+  
+  return Uint8List.fromList(outputBytes);
+}
+
+// ===== HELPER: Extract paragraphs from body =====
+void _extractParagraphsFromBody(XmlElement body, List<XmlElement> paragraphs) {
+  print('🔍 [EXTRACT] Extracting paragraphs from body...');
+  
+  // Get direct paragraph children
+  for (final child in body.children.whereType<XmlElement>()) {
+    if (child.name.local == 'p') {
+      paragraphs.add(child);
+    } else if (child.name.local == 'tbl') {
+      // Extract from tables
+      for (final row in child.findAllElements('w:tr')) {
+        for (final cell in row.findAllElements('w:tc')) {
+          for (final para in cell.children.whereType<XmlElement>()) {
+            if (para.name.local == 'p') {
+              paragraphs.add(para);
+            }
+          }
+        }
+      }
+    }
+  }
+  
+  print('🔍 [EXTRACT] Extracted ${paragraphs.length} paragraphs');
+}
+
+// ===== HELPER: Translate single paragraph =====
+Future<void> _translateParagraph(
+  XmlElement paraElem,
+  DocxTranslator translator,
+  String sourceLang,
+  String targetLang,
+  WordAligner aligner,
+  Function(String translated, List<Alignment> alignments) onComplete,
+) async {
+  // Extract with formatting
+  final transPara = translator.extractParagraph(paraElem);
+  final originalText = transPara.getText();
+  
+  // Translate
+  final translatedText = await onnxService.translate(
+    originalText,
+    targetLang,
+    sourceLanguage: sourceLang,
+  );
+  
+  print('📝 [PARA] Translated: "${translatedText.substring(0, translatedText.length > 60 ? 60 : translatedText.length)}..."');
+  
+  // Get alignments
+  final srcCleanWords = transPara.getWords();
+  final tgtCleanWords = RegExp(r'[\p{L}\p{N}]+', unicode: true)
+      .allMatches(translatedText)
+      .map((m) => m.group(0)!)
+      .toList();
+
+  print('🔗 [PARA] Aligning: ${srcCleanWords.length} → ${tgtCleanWords.length}');
+  final alignments = aligner.align(srcCleanWords, tgtCleanWords);
+  print('🔗 [PARA] Got ${alignments.length} alignments');
+  
+  // Reconstruct with aligned formatting
+  translator.applyAlignedFormatting(
+    paraElem,
+    transPara,
+    translatedText,
+    alignments,
+  );
+  
+  onComplete(translatedText, alignments);
+}
+
+
   Future<int> _countSegments(Uint8List docxBytes) async {
     try {
       final archive = ZipDecoder().decodeBytes(docxBytes);

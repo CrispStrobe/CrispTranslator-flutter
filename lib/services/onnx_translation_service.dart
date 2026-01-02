@@ -11,7 +11,7 @@ class ONNXTranslationService {
   NLLBTokenizer? _tokenizer;
   bool _isInitialized = false;
 
-  final int maxTokens = 256;
+  // final int maxTokens = 256;
   static const int hiddenSize = 1024;
   static const int numLayers = 12;
   static const int numHeads = 16;
@@ -89,65 +89,76 @@ class ONNXTranslationService {
   }
 
   Future<String> translate(
-    String text,
-    String targetLanguage, {
-    String sourceLanguage = 'English',
-  }) async {
-    if (!_isInitialized) throw StateError('Service not initialized');
+  String text,
+  String targetLanguage, {
+  String sourceLanguage = 'English',
+}) async {
+  if (!_isInitialized) throw StateError('Service not initialized');
 
-    final startTime = DateTime.now();
-    print('\n' + '=' * 70);
-    print('🔤 Translation: "$text"');
-    print('   $sourceLanguage → $targetLanguage');
-    print('=' * 70);
+  final startTime = DateTime.now();
+  print('\n' + '=' * 70);
+  print('🔤 Translation: "$text"');
+  print('   $sourceLanguage → $targetLanguage');
+  print('=' * 70);
 
-    try {
-      // 1. Tokenize with source language
-      final tokStart = DateTime.now();
-      final encoding = _tokenizer!.encode(text, sourceLanguage: sourceLanguage);
+  try {
+    // 1. Tokenize with source language
+    final tokStart = DateTime.now();
+    final encoding = _tokenizer!.encode(text, sourceLanguage: sourceLanguage);
 
-      print('\n--- CROSS-CHECK LOG (DART vs PYTHON) ---');
-      print('DART Encoder IDs:   ${encoding.inputIds.take(15).toList()}');
-      final targetLangId = _tokenizer!.getLanguageTokenId(targetLanguage);
-      print('DART Source Lang: $sourceLanguage');
-      print('DART Target Lang ID: $targetLangId');
+    print('\n--- CROSS-CHECK LOG (DART vs PYTHON) ---');
+    print('DART Encoder IDs:   ${encoding.inputIds.take(15).toList()}');
+    final targetLangId = _tokenizer!.getLanguageTokenId(targetLanguage);
+    print('DART Source Lang: $sourceLanguage');
+    print('DART Target Lang ID: $targetLangId');
 
-      final actualLength = encoding.attentionMask.where((m) => m == 1).length;
-      print(
-          '📝 Tokens: $actualLength (${DateTime.now().difference(tokStart).inMilliseconds}ms)');
+    final actualLength = encoding.attentionMask.where((m) => m == 1).length;
+    print('📝 Tokens: $actualLength (${DateTime.now().difference(tokStart).inMilliseconds}ms)');
 
-      // Rest stays the same...
-      final encStart = DateTime.now();
-      final encoderOutput = await _runEncoder(encoding);
-      print(
-          '🔄 Encoder: ${DateTime.now().difference(encStart).inMilliseconds}ms');
+    // ✅ Calculate dynamic max length based on input
+    final dynamicMaxLength = _calculateMaxLength(actualLength);
+    print('📏 [DECODER] Dynamic max_length: $dynamicMaxLength (input: $actualLength)');
 
-      final decStart = DateTime.now();
-      final outputIds = await _runDecoderWithCache(
-        encoderOutput,
-        encoding,
-        targetLanguage,
-      );
-      print(
-          '🔄 Decoder: ${DateTime.now().difference(decStart).inMilliseconds}ms');
+    // 2. Run encoder
+    final encStart = DateTime.now();
+    final encoderOutput = await _runEncoder(encoding);
+    print('🔄 Encoder: ${DateTime.now().difference(encStart).inMilliseconds}ms');
 
-      final detokStart = DateTime.now();
-      final translation = _tokenizer!.decode(outputIds);
-      print(
-          '📝 Detokenize: ${DateTime.now().difference(detokStart).inMilliseconds}ms');
+    // 3. Run decoder with dynamic max length
+    final decStart = DateTime.now();
+    final outputIds = await _runDecoderWithCache(
+      encoderOutput,
+      encoding,
+      targetLanguage,
+      maxLength: dynamicMaxLength, // ✅ Pass dynamic length
+    );
+    print('🔄 Decoder: ${DateTime.now().difference(decStart).inMilliseconds}ms');
 
-      final totalTime = DateTime.now().difference(startTime).inMilliseconds;
-      print('✅ Total: ${totalTime}ms');
-      print('   Result: "$translation"');
-      print('=' * 70 + '\n');
+    // 4. Detokenize
+    final detokStart = DateTime.now();
+    final translation = _tokenizer!.decode(outputIds);
+    print('📝 Detokenize: ${DateTime.now().difference(detokStart).inMilliseconds}ms');
 
-      return translation;
-    } catch (e, stack) {
-      print('❌ Translation failed: $e');
-      print(stack);
-      rethrow;
-    }
+    final totalTime = DateTime.now().difference(startTime).inMilliseconds;
+    print('✅ Total: ${totalTime}ms');
+    print('   Result: "$translation"');
+    print('=' * 70 + '\n');
+
+    return translation;
+  } catch (e, stack) {
+    print('❌ Translation failed: $e');
+    print(stack);
+    rethrow;
   }
+}
+
+// Calculate appropriate max length
+int _calculateMaxLength(int inputLength) {
+  // Rule: output can be 2-3x longer than input for most language pairs
+  // Min: 64 tokens, Max: 512 tokens
+  final calculated = (inputLength * 2.5).toInt();
+  return calculated.clamp(64, 512);
+}
 
   Future<OrtValue?> _runEncoder(TokenizerOutput encoding) async {
     print('\n🔧 [Encoder] Running encoder...');
@@ -198,177 +209,180 @@ class ONNXTranslationService {
   }
 
   Future<List<int>> _runDecoderWithCache(
-    OrtValue? encoderOutput,
-    TokenizerOutput encoding,
-    String targetLanguage,
-  ) async {
-    print('\n🔧 [Decoder] Starting decoder with KV cache...');
+  OrtValue? encoderOutput,
+  TokenizerOutput encoding,
+  String targetLanguage, {
+  int maxLength = 128, // ✅ Accept as parameter with default
+}) async {
+  print('\n🔧 [Decoder] Starting decoder with KV cache...');
+  print('📏 [Decoder] Max length: $maxLength');
 
-    final targetLangId = _tokenizer!.getLanguageTokenId(targetLanguage);
-    final decoderTokens = <int>[2, targetLangId];
-    final int encoderSeqLen = (encoderOutput!.value as List)[0].length;
+  final targetLangId = _tokenizer!.getLanguageTokenId(targetLanguage);
+  final decoderTokens = <int>[2, targetLangId];
+  final int encoderSeqLen = (encoderOutput!.value as List)[0].length;
 
-    print('DEBUG [Decoder] Starting sequence: $decoderTokens');
-    print('DEBUG [Decoder] Encoder sequence length: $encoderSeqLen');
+  print('DEBUG [Decoder] Starting sequence: $decoderTokens');
+  print('DEBUG [Decoder] Encoder sequence length: $encoderSeqLen');
 
-    final fullEncoderMask = Int64List.fromList(
-        encoding.attentionMask.map((e) => e.toInt()).toList());
+  final fullEncoderMask = Int64List.fromList(
+      encoding.attentionMask.map((e) => e.toInt()).toList());
 
-    Map<String, OrtValue> decoderKVs = {};
-    Map<String, OrtValue> encoderKVs = {};
+  Map<String, OrtValue> decoderKVs = {};
+  Map<String, OrtValue> encoderKVs = {};
 
-    // ✅ Track only what WE create
-    int inputTensorsCreated = 0;
-    int inputTensorsReleased = 0;
+  int inputTensorsCreated = 0;
+  int inputTensorsReleased = 0;
 
-    try {
-      for (int step = 0; step < 128; step++) {
-        final DateTime stepStart = DateTime.now();
-        final bool isStep0 = step == 0;
-        final session = isStep0 ? _decoderSession! : _decoderWithPastSession!;
+  try {
+    for (int step = 0; step < maxLength; step++) { // ✅ Use maxLength parameter
+      final DateTime stepStart = DateTime.now();
+      final bool isStep0 = step == 0;
+      final session = isStep0 ? _decoderSession! : _decoderWithPastSession!;
 
-        print('\n${"=" * 70}');
-        print('DEBUG [Decoder] --- STEP $step ---');
-        print('${"=" * 70}');
-
-        final currentInputIds = isStep0 ? decoderTokens : [decoderTokens.last];
-        print('DEBUG [Decoder] Input IDs: $currentInputIds');
-
-        // Create input tensors
-        final idTensor = OrtValueTensor.createTensorWithDataList(
-            Int64List.fromList(currentInputIds), [1, currentInputIds.length]);
-        inputTensorsCreated++;
-
-        final maskTensor = OrtValueTensor.createTensorWithDataList(
-            fullEncoderMask, [1, encoderSeqLen]);
-        inputTensorsCreated++;
-
-        final inputs = <String, OrtValue>{
-          'input_ids': idTensor,
-          'encoder_attention_mask': maskTensor,
-        };
-
-        if (isStep0) {
-          inputs['encoder_hidden_states'] = encoderOutput;
-          print('DEBUG [Decoder] Step 0: Using regular decoder');
-        } else {
-          inputs.addAll(decoderKVs);
-          inputs.addAll(encoderKVs);
-          print(
-              'DEBUG [Decoder] Step $step: Using decoder_with_past (${decoderKVs.length} decoder + ${encoderKVs.length} encoder KVs)');
-        }
-
-        final runOptions = OrtRunOptions();
-        final outputs = await session.runAsync(runOptions, inputs);
-
-        if (outputs == null || outputs.isEmpty) {
-          throw Exception('Step $step failed');
-        }
-
-        // Extract next token
-        final logitsValue = outputs[0]!;
-        final List logits = logitsValue.value as List;
-        final List stepLogits = logits[0][currentInputIds.length - 1] as List;
-
-        int nextToken = 0;
-        double maxVal = double.negativeInfinity;
-        for (int i = 0; i < stepLogits.length; i++) {
-          double val = (stepLogits[i] as num).toDouble();
-          if (val > maxVal) {
-            maxVal = val;
-            nextToken = i;
-          }
-        }
-
-        // Release logits immediately
-        logitsValue.release();
-
-        final word = _tokenizer!.decode([nextToken]);
-        final elapsed = DateTime.now().difference(stepStart).inMilliseconds;
-        print(
-            '✅ [Decoder] Step $step: Token $nextToken -> "$word" | Logit: ${maxVal.toStringAsFixed(3)} | ${elapsed}ms');
-
-        // Manage KV Tensors
-        if (isStep0) {
-          final names = session.outputNames;
-          int decoderCount = 0, encoderCount = 0;
-
-          for (int i = 1; i < outputs.length; i++) {
-            final pastName =
-                names[i].replaceFirst('present', 'past_key_values');
-            if (pastName.contains('.decoder.')) {
-              decoderKVs[pastName] = outputs[i]!;
-              decoderCount++;
-            } else if (pastName.contains('.encoder.')) {
-              encoderKVs[pastName] = outputs[i]!;
-              encoderCount++;
-            }
-          }
-
-          print(
-              '💾 [Memory] Received $decoderCount decoder + $encoderCount encoder KVs from ONNX');
-        } else {
-          // Release old decoder KVs
-          final oldCount = decoderKVs.length;
-          decoderKVs.forEach((k, v) => v.release());
-          decoderKVs.clear();
-
-          // Store new decoder KVs
-          final names = session.outputNames;
-          for (int i = 1; i < outputs.length; i++) {
-            final pastName =
-                names[i].replaceFirst('present', 'past_key_values');
-            decoderKVs[pastName] = outputs[i]!;
-          }
-          print(
-              '💾 [Memory] Cycled ${decoderKVs.length} decoder KVs (released $oldCount old)');
-        }
-
-        // Release input tensors immediately
-        idTensor.release();
-        maskTensor.release();
-        runOptions.release();
-        inputTensorsReleased += 2;
-
-        if (nextToken == 2) {
-          print('⚠️  [Decoder] EOS token reached at step $step');
-          break;
-        }
-
-        decoderTokens.add(nextToken);
-      }
-    } finally {
       print('\n${"=" * 70}');
-      print('💾 [Memory] FINAL CLEANUP');
+      print('DEBUG [Decoder] --- STEP $step ---');
       print('${"=" * 70}');
 
-      // Cleanup KVs
-      final decoderCount = decoderKVs.length;
-      decoderKVs.forEach((k, v) => v.release());
-      print('💾 [Memory] Released $decoderCount final decoder KVs');
+      final currentInputIds = isStep0 ? decoderTokens : [decoderTokens.last];
+      print('DEBUG [Decoder] Input IDs: $currentInputIds');
 
-      final encoderCount = encoderKVs.length;
-      encoderKVs.forEach((k, v) => v.release());
-      print('💾 [Memory] Released $encoderCount final encoder KVs');
+      // Create input tensors
+      final idTensor = OrtValueTensor.createTensorWithDataList(
+          Int64List.fromList(currentInputIds), [1, currentInputIds.length]);
+      inputTensorsCreated++;
 
-      print('\n💾 [Memory] INPUT TENSOR TRACKING:');
-      print('   Created: $inputTensorsCreated input tensors');
-      print('   Released: $inputTensorsReleased input tensors');
-      if (inputTensorsCreated == inputTensorsReleased) {
-        print('   ✅ Perfect - all input tensors released!');
+      final maskTensor = OrtValueTensor.createTensorWithDataList(
+          fullEncoderMask, [1, encoderSeqLen]);
+      inputTensorsCreated++;
+
+      final inputs = <String, OrtValue>{
+        'input_ids': idTensor,
+        'encoder_attention_mask': maskTensor,
+      };
+
+      if (isStep0) {
+        inputs['encoder_hidden_states'] = encoderOutput;
+        print('DEBUG [Decoder] Step 0: Using regular decoder');
       } else {
+        inputs.addAll(decoderKVs);
+        inputs.addAll(encoderKVs);
         print(
-            '   ⚠️  Leak: ${inputTensorsCreated - inputTensorsReleased} input tensors not released!');
+            'DEBUG [Decoder] Step $step: Using decoder_with_past (${decoderKVs.length} decoder + ${encoderKVs.length} encoder KVs)');
       }
-      print('\n💾 [Memory] KV TENSORS:');
-      print('   KVs are created by ONNX and released by us');
-      print('   ✅ All KVs properly released in finally block');
-      print('${"=" * 70}');
-    }
 
-    print('\n📊 [Decoder] Final sequence: $decoderTokens');
-    return decoderTokens.sublist(2);
+      final runOptions = OrtRunOptions();
+      final outputs = await session.runAsync(runOptions, inputs);
+
+      if (outputs == null || outputs.isEmpty) {
+        throw Exception('Step $step failed');
+      }
+
+      // Extract next token
+      final logitsValue = outputs[0]!;
+      final List logits = logitsValue.value as List;
+      final List stepLogits = logits[0][currentInputIds.length - 1] as List;
+
+      int nextToken = 0;
+      double maxVal = double.negativeInfinity;
+      for (int i = 0; i < stepLogits.length; i++) {
+        double val = (stepLogits[i] as num).toDouble();
+        if (val > maxVal) {
+          maxVal = val;
+          nextToken = i;
+        }
+      }
+
+      logitsValue.release();
+
+      final word = _tokenizer!.decode([nextToken]);
+      final elapsed = DateTime.now().difference(stepStart).inMilliseconds;
+      print(
+          '✅ [Decoder] Step $step: Token $nextToken -> "$word" | Logit: ${maxVal.toStringAsFixed(3)} | ${elapsed}ms');
+
+      // Manage KV Tensors
+      if (isStep0) {
+        final names = session.outputNames;
+        int decoderCount = 0, encoderCount = 0;
+
+        for (int i = 1; i < outputs.length; i++) {
+          final pastName =
+              names[i].replaceFirst('present', 'past_key_values');
+          if (pastName.contains('.decoder.')) {
+            decoderKVs[pastName] = outputs[i]!;
+            decoderCount++;
+          } else if (pastName.contains('.encoder.')) {
+            encoderKVs[pastName] = outputs[i]!;
+            encoderCount++;
+          }
+        }
+
+        print(
+            '💾 [Memory] Received $decoderCount decoder + $encoderCount encoder KVs from ONNX');
+      } else {
+        final oldCount = decoderKVs.length;
+        decoderKVs.forEach((k, v) => v.release());
+        decoderKVs.clear();
+
+        final names = session.outputNames;
+        for (int i = 1; i < outputs.length; i++) {
+          final pastName =
+              names[i].replaceFirst('present', 'past_key_values');
+          decoderKVs[pastName] = outputs[i]!;
+        }
+        print(
+            '💾 [Memory] Cycled ${decoderKVs.length} decoder KVs (released $oldCount old)');
+      }
+
+      // Release input tensors
+      idTensor.release();
+      maskTensor.release();
+      runOptions.release();
+      inputTensorsReleased += 2;
+
+      if (nextToken == 2) {
+        print('⚠️  [Decoder] EOS token reached at step $step');
+        break;
+      }
+
+      decoderTokens.add(nextToken);
+    }
+    
+    // ✅ Warn if we hit max length without EOS
+    if (decoderTokens.last != 2) {
+      print('⚠️  [Decoder] Reached max_length=$maxLength without EOS - translation may be incomplete');
+    }
+    
+  } finally {
+    print('\n${"=" * 70}');
+    print('💾 [Memory] FINAL CLEANUP');
+    print('${"=" * 70}');
+
+    final decoderCount = decoderKVs.length;
+    decoderKVs.forEach((k, v) => v.release());
+    print('💾 [Memory] Released $decoderCount final decoder KVs');
+
+    final encoderCount = encoderKVs.length;
+    encoderKVs.forEach((k, v) => v.release());
+    print('💾 [Memory] Released $encoderCount final encoder KVs');
+
+    print('\n💾 [Memory] INPUT TENSOR TRACKING:');
+    print('   Created: $inputTensorsCreated input tensors');
+    print('   Released: $inputTensorsReleased input tensors');
+    if (inputTensorsCreated == inputTensorsReleased) {
+      print('   ✅ Perfect - all input tensors released!');
+    } else {
+      print(
+          '   ⚠️  Leak: ${inputTensorsCreated - inputTensorsReleased} input tensors not released!');
+    }
+    print('\n💾 [Memory] KV TENSORS:');
+    print('   KVs are created by ONNX and released by us');
+    print('   ✅ All KVs properly released in finally block');
+    print('${"=" * 70}');
   }
+
+  print('\n📊 [Decoder] Final sequence: $decoderTokens');
+  return decoderTokens.sublist(2);
+}
 
   int _argmax(List logits) {
     int maxIdx = 0;
