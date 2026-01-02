@@ -339,15 +339,16 @@ int _calculateMaxLength(int inputLength) {
       runOptions.release();
       inputTensorsReleased += 2;
 
+      // Add token FIRST, then check for EOS
+      decoderTokens.add(nextToken);
+      
       if (nextToken == 2) {
         print('⚠️  [Decoder] EOS token reached at step $step');
         break;
       }
-
-      decoderTokens.add(nextToken);
     }
     
-    // ✅ Warn if we hit max length without EOS
+    // Only warn if we exited loop without hitting EOS
     if (decoderTokens.last != 2) {
       print('⚠️  [Decoder] Reached max_length=$maxLength without EOS - translation may be incomplete');
     }

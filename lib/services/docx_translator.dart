@@ -1122,10 +1122,9 @@ String _getResolvedFontName(XmlElement paraElem) {
   final fontTemplate = transPara.runs.isNotEmpty ? transPara.runs[0] : null;
   print('🔍 [DEBUG] Font template: ${fontTemplate != null ? "${fontTemplate.fontName}@${fontTemplate.fontSize}pt" : "NULL"}');
   
-  // ✅ CRITICAL: Extract footnote references BEFORE clearing
+  // ✅ STEP 1: Extract footnote references BEFORE clearing
   final footnoteRuns = <XmlElement>[];
   for (final run in paraElem.findElements('w:r')) {
-    // Check if this run contains a footnote reference
     final hasFootnoteRef = run.descendants.any((d) => 
       d is XmlElement && (d.name.local == 'footnoteReference' || d.name.local == 'footnoteRef')
     );
@@ -1136,7 +1135,7 @@ String _getResolvedFontName(XmlElement paraElem) {
     }
   }
   
-  // STEP 1: FORCE RESTORE PARAGRAPH-LEVEL METADATA
+  // STEP 2: FORCE RESTORE PARAGRAPH-LEVEL METADATA
   var pPr = paraElem.findElements('w:pPr').firstOrNull;
   
   if (pPr == null && transPara.metadata.isNotEmpty) {
@@ -1154,14 +1153,32 @@ String _getResolvedFontName(XmlElement paraElem) {
     _restoreSpacing(pPr, transPara.metadata);
   }
   
-  // STEP 2: Clear existing runs (AFTER extracting footnote refs)
+  // STEP 3: Clear existing runs
   final existingRuns = paraElem.findElements('w:r').toList();
   for (final run in existingRuns) {
     paraElem.children.remove(run);
   }
   print('🗑️  [DEBUG] Cleared ${existingRuns.length} existing runs');
   
-  // STEP 3: Prepare alignment mapping
+  // ✅ STEP 4: RE-ATTACH FOOTNOTE REFERENCES AT BEGINNING (after pPr)
+  if (footnoteRuns.isNotEmpty) {
+    print('📎 [DEBUG] Re-attaching ${footnoteRuns.length} footnote references at BEGINNING');
+    
+    // Find insertion point (after pPr if it exists)
+    int insertIndex = 0;
+    if (pPr != null) {
+      final pPrIndex = paraElem.children.indexOf(pPr);
+      insertIndex = pPrIndex + 1;
+    }
+    
+    // Insert all footnote runs at beginning
+    for (final footnoteRun in footnoteRuns) {
+      paraElem.children.insert(insertIndex, footnoteRun);
+      insertIndex++; // Move insertion point forward for next footnote
+    }
+  }
+  
+  // STEP 5: Prepare alignment mapping
   final srcCleanWords = transPara.getWords();
   final tgtRawUnits = translatedText.split(RegExp(r'\s+'));
   final formattedIndices = transPara.getFormattedWordIndices();
@@ -1180,7 +1197,7 @@ String _getResolvedFontName(XmlElement paraElem) {
     }
   }
   
-  // STEP 4: Reconstruct runs with aligned formatting
+  // STEP 6: Reconstruct runs with aligned formatting
   print('🔧 [DEBUG] Reconstructing ${tgtRawUnits.length} runs...');
   
   for (int i = 0; i < tgtRawUnits.length; i++) {
@@ -1216,14 +1233,6 @@ String _getResolvedFontName(XmlElement paraElem) {
     );
     
     paraElem.children.add(newRun);
-  }
-  
-  // ✅ STEP 5: RE-ATTACH FOOTNOTE REFERENCES AT END
-  if (footnoteRuns.isNotEmpty) {
-    print('📎 [DEBUG] Re-attaching ${footnoteRuns.length} footnote references');
-    for (final footnoteRun in footnoteRuns) {
-      paraElem.children.add(footnoteRun);
-    }
   }
   
   print('✨ [DEBUG] Created ${tgtRawUnits.length} new runs + ${footnoteRuns.length} footnote refs');
